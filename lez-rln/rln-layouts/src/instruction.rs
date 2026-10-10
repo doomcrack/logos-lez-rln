@@ -59,6 +59,7 @@ pub enum Instruction {
     },
     Register {
         tree_id: [u8; 32],
+        /// A BN254 field element, non-zero.
         id_commitment: [u8; 32],
         rate_limit: u64,
         /// Claim: asserted equal to the config's `merkle_program_id`.

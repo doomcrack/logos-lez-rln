@@ -266,6 +266,8 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
             let [config, tree_main, payer, treasury, clock, membership] =
                 accounts(input, "Register");
             validate_field_element(&id_commitment);
+            // Zero is the empty-leaf value and no identity secret hashes to it.
+            assert!(id_commitment != [0u8; 32], "id_commitment must not be zero");
             validate_rate_limit(rate_limit);
             require_own_pda(input, config, config_seed(&tree_id), "config");
             require_tree_main(input, tree_main, &tree_id, &merkle_program_id);
@@ -955,6 +957,41 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "id_commitment must not be zero")]
+    fn plan_register_rejects_zero_commitment() {
+        let Instruction::Register {
+            tree_id,
+            rate_limit,
+            merkle_program_id,
+            now_ms,
+            price_per_unit,
+            active_duration_sec,
+            grace_period_duration_sec,
+            ..
+        } = register_ix()
+        else {
+            unreachable!()
+        };
+        let ix = Instruction::Register {
+            tree_id,
+            id_commitment: [0u8; 32],
+            rate_limit,
+            merkle_program_id,
+            now_ms,
+            price_per_unit,
+            active_duration_sec,
+            grace_period_duration_sec,
+        };
+        let mut accounts = register_accounts();
+        accounts[5] = AccountMeta::new(
+            pda_of(membership_seed(&TREE_ID, &[0u8; 32])),
+            false,
+            self_id(),
+        );
+        let _ = plan(&input(accounts), ix);
     }
 
     #[test]
