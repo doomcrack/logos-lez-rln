@@ -32,7 +32,7 @@ rm -rf "$E2E"
 mkdir -p "$LEE_WALLET_HOME_DIR"
 cat > "$LEE_WALLET_HOME_DIR/wallet_config.json" <<JSON
 {
-  "sequencers": [{ "sequencer_addr": "http://127.0.0.1:$PORT/" }],
+  "sequencer": { "sequencer_addr": "http://127.0.0.1:$PORT/" },
   "seq_poll_timeout": "30s",
   "seq_tx_poll_max_blocks": 15,
   "seq_poll_max_retries": 10,

@@ -69,8 +69,8 @@ if [ -n "$ADOPT" ]; then
   [ -f "$ADOPT" ] || { echo "adopt wallet not found: $ADOPT" >&2; exit 1; }
   cp "$ADOPT" "$WS/storage.json"; echo "provision: adopting wallet $ADOPT"
 fi
-# Dual-shape sequencer field — see stage.sh: `sequencers` for the upstream
-# wallet, flat `sequencer_addr` for the module's wallet. calibration_limit: see
+# Triple-shape sequencer field — see stage.sh: `sequencer` (v0.3.1 wallet),
+# `sequencers` (v0.3.0), flat `sequencer_addr` (module). calibration_limit: see
 # stage.sh — opening the wallet probes calibration_limit times (default 100).
 # gas_limit: the wallet's own default is 2,000,000, and a registration costs
 # about 9.1M — an on-chain merkle insert is one Poseidon compression, roughly
@@ -82,7 +82,7 @@ fi
 # run_setup's own deploy and init txs, so the payer's reserve must cover
 # gas_limit x base fee for each. LEZ_RLN_GAS_LIMIT (default 10,000,000)
 # separately sets what register/extend/erase declare.
-jq -n --arg s "$SEQUENCER" '{sequencer_addr:$s, sequencers:[{sequencer_addr:$s}], seq_poll_timeout:"30s", seq_tx_poll_max_blocks:15, seq_poll_max_retries:10, seq_block_poll_max_amount:100, gas_limit:10000000, multi_sequencer_client_config:{distribution_limit:1, calibration_limit:3}}' > "$WS/wallet_config.json"
+jq -n --arg s "$SEQUENCER" '{sequencer_addr:$s, sequencer:{sequencer_addr:$s}, sequencers:[{sequencer_addr:$s}], seq_poll_timeout:"30s", seq_tx_poll_max_blocks:15, seq_poll_max_retries:10, seq_block_poll_max_amount:100, gas_limit:10000000, multi_sequencer_client_config:{distribution_limit:1, calibration_limit:3}}' > "$WS/wallet_config.json"
 
 echo "provision: tree=$TREE sequencer=$SEQUENCER payer=$PAYER (deploying via run_setup — several min)"
 export HOME="$WS" LEE_WALLET_HOME_DIR="$WS"

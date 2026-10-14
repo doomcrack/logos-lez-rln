@@ -27,6 +27,11 @@
   can be redeployed under the same ids with `UpdateHeader` — but the image id
   the host compares against changes, so finish guest comment churn BEFORE
   provisioning.
+- The same metadata embeds the cargo git-checkout path of every dependency,
+  which contains the pinned commit hash. Bumping the LEZ tag therefore changes
+  both image ids even when `lee_core` and `clock_core` are byte-identical
+  across the tags (v0.3.0 -> v0.3.1: no source change, both bins differ), so
+  every dependency bump is a redeploy.
 
 ## Execution model: plan, then apply, one shard per session
 - A program's `plan` sees `AccountMeta { account_id, is_authorized,

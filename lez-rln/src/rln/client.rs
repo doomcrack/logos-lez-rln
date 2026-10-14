@@ -87,15 +87,11 @@ pub const DATA_DIR: &str = ".logos-lez-rln";
 pub async fn init_wallet() -> WalletCore {
     let config_path = wallet::helperfunctions::fetch_config_path().unwrap();
     let storage_path = wallet::helperfunctions::fetch_persistent_storage_path().unwrap();
-    let statistics_path = wallet::helperfunctions::fetch_statistics_path().unwrap();
     if storage_path.exists() {
-        WalletCore::new_update_chain(config_path, storage_path, statistics_path, None)
-            .await
-            .unwrap()
+        WalletCore::new_update_chain(config_path, storage_path, None).unwrap()
     } else {
         println!("First run: initializing wallet storage at {storage_path:?}");
-        WalletCore::new_init_storage(config_path, storage_path, statistics_path, None, "")
-            .await
+        WalletCore::new_init_storage(config_path, storage_path, None, "")
             .unwrap()
             .0
     }
@@ -821,7 +817,7 @@ async fn send_metered_tx(
 
     use sequencer_service_rpc::RpcClient as _;
     wallet_core
-        .helm_owned()
+        .client()
         .send_transaction(common::transaction::LeeTransaction::Public(
             nssa::PublicTransaction::new(message, witness),
         ))
@@ -900,7 +896,7 @@ fn fee_reserve<E>(quote: Result<FeeStateQuote, E>, gas_limit: u64) -> (u128, Res
 /// disagree about the fee state they were sized against.
 async fn quoted_fee_reserve(wallet_core: &WalletCore, label: &str) -> (u128, ReserveBasis) {
     use sequencer_service_rpc::RpcClient as _;
-    let quote = wallet_core.helm_owned().get_fee_state().await;
+    let quote = wallet_core.client().get_fee_state().await;
     if let Err(e) = &quote {
         eprintln!("{label}: getFeeState failed ({e}); reserving the fixed {DECLARED_MAX_FEE}");
     }
