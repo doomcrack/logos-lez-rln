@@ -428,13 +428,47 @@ async fn program_deployed_at(
     header_deployed(&shard, image_id)
 }
 
+/// How many consecutive already-written key-chain accounts a deploy skips
+/// before giving up on the wallet.
+const FRESH_ACCOUNT_ATTEMPTS: usize = 64;
+
+/// The next account on the wallet's key chain whose loader shard is empty
+/// on chain.
+///
+/// The key chain is derived from the wallet seed, so a wallet restored or
+/// copied from the same seed re-derives the accounts an earlier deploy
+/// already claimed; `CreateHeader` and `WriteSegment` both fail on a
+/// written loader shard and are charged in full. Accounts that are already
+/// written are skipped, which also steps past the leftovers of an
+/// interrupted upload.
+async fn fresh_loader_account(wallet_core: &mut WalletCore, label: &str) -> AccountId {
+    for _ in 0..FRESH_ACCOUNT_ATTEMPTS {
+        let (account, _) = wallet_core.create_new_account_public(None);
+        let shard = read_shard(
+            wallet_core,
+            ProgramShardSelector::new(account, PROGRAM_LOADER_ACCOUNT_ID),
+            label,
+        )
+        .await;
+        if shard.is_empty() {
+            return account;
+        }
+        println!("  {label}: skipping {account}, its loader shard is already written");
+    }
+    panic!(
+        "{label}: the next {FRESH_ACCOUNT_ATTEMPTS} wallet accounts all hold loader data; use a \
+         wallet with an unused key chain"
+    );
+}
+
 /// Deploy `program` to a fresh keyed header account, uploading its user ELF
 /// to fresh keyed segment accounts. Returns the header, which is the
 /// program's account id.
 ///
 /// The wallet's loader cannot resume a partial upload, and segments are
-/// write-once, so every call uploads to new accounts; a deploy interrupted
-/// midway leaves its accounts behind and a re-run starts over.
+/// write-once, so every call uploads to accounts that are empty on chain; a
+/// deploy interrupted midway leaves its accounts behind and a re-run steps
+/// past them.
 pub async fn deploy_program(
     wallet_core: &mut WalletCore,
     program: &Program,
@@ -456,10 +490,11 @@ pub async fn deploy_program(
         panic!("{program_name}: deploying needs a funded payer — set LEZ_RLN_PAYER")
     });
 
-    let (header, _) = wallet_core.create_new_account_public(None);
-    let segments: Vec<AccountId> = (0..segment_count)
-        .map(|_| wallet_core.create_new_account_public(None).0)
-        .collect();
+    let header = fresh_loader_account(wallet_core, program_name).await;
+    let mut segments = Vec::with_capacity(segment_count);
+    for _ in 0..segment_count {
+        segments.push(fresh_loader_account(wallet_core, program_name).await);
+    }
     // The header and segment keys have to outlive a failed deploy: the header
     // key is what `UpdateHeader` would sign with.
     wallet_core
