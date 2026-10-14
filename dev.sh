@@ -6,7 +6,7 @@ cd "$SCRIPT_DIR"
 
 # Keep this in sync with the logos-execution-zone git dep pin in
 # lez-rln/Cargo.toml and lez-rln/methods/guest/Cargo.toml.
-LEZ_REF="v0.3.0"
+LEZ_REF="v0.3.1"
 LEZ_REPO="https://github.com/logos-blockchain/logos-execution-zone.git"
 SEQ_SRC="${LEZ_RLN_SEQUENCER_SRC:-${XDG_CACHE_HOME:-$HOME/.cache}/logos-lez-rln/sequencer-src}"
 

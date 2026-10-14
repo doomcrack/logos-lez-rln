@@ -20,15 +20,15 @@ workspace = true
 # LEZ crates fetched as git deps (lee/lee_core aliased as nssa/nssa_core so the
 # source keeps its historical import names). Pinned by tag so a fresh clone
 # builds with no sibling checkout.
-nssa = { package = "lee", git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.0" }
-nssa_core = { package = "lee_core", git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.0" }
-wallet = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.0" }
-common = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.0" }
-sequencer_service_rpc = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.0", features = ["client"] }
-sequencer_service_protocol = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.0" }
-programs = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.0" }
-program_loader_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.0" }
-clock_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.0" }
+nssa = { package = "lee", git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1" }
+nssa_core = { package = "lee_core", git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1" }
+wallet = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1" }
+common = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1" }
+sequencer_service_rpc = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1", features = ["client"] }
+sequencer_service_protocol = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1" }
+programs = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1" }
+program_loader_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1" }
+clock_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1" }
 borsh = { version = "1", features = ["derive"] }
 
 rln-layouts = { path = "rln-layouts" }
@@ -75,8 +75,7 @@ name = "account_balance"
 path = "src/bin/account_balance.rs"
 
 [dev-dependencies]
-nssa = { package = "lee", git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.0", features = ["test-utils"] }
-token_core = { git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.0" }
+nssa = { package = "lee", git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1", features = ["test-utils"] }
 # Cycle harness (src/cycle_harness.rs) drives the guest through the same
 # risc0 executor the sequencer uses, to measure per-execution user cycles
 # against the 2^25 session cap. Pinned to the version nssa already resolves.

@@ -469,7 +469,7 @@ dependencies = [
 [[package]]
 name = "clock_core"
 version = "0.1.0"
-source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.3.0#db66590ab821a4e142c211017a3866d007f6fa77"
+source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.3.1#1a003bfbfb89fcf987f62975cd08a401169e1b8c"
 dependencies = [
  "borsh",
  "lee_core",
@@ -1042,7 +1042,7 @@ dependencies = [
 [[package]]
 name = "lee_core"
 version = "0.1.0"
-source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.3.0#db66590ab821a4e142c211017a3866d007f6fa77"
+source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.3.1#1a003bfbfb89fcf987f62975cd08a401169e1b8c"
 dependencies = [
  "base58",
  "borsh",
