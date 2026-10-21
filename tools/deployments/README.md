@@ -8,7 +8,7 @@ A **deployment** = one on-chain RLN instance, fully captured by two files:
 
 ```
 deployments/<name>/
-  deployment.json   # tree_id + sequencer + both program ids + derived config + payer/treasury
+  deployment.json   # tree_id + sequencer + program id + derived config + payer/treasury
   storage.json      # the wallet (holds the payer's keypair)
 ```
 
@@ -20,22 +20,25 @@ deployments/<name>/
   "tree_id": "<64 hex>",
   "sequencer": "<url>",
   "registration_program_id": "<64 hex>",
-  "merkle_program_id": "<64 hex>",
   "config_account": "<base58>",
   "payer_account": "<base58>",
   "treasury_account": "<base58>"
 }
 ```
 
-**Program ids are recorded, not derived.** A program's account id is the header account its
+**The program id is recorded, not derived.** A program's account id is the header account its
 deployer created and signed in `run_setup`; it is not a function of the guest `.bin`.
-`run_setup` writes both ids to `~/.logos-lez-rln/programs_<tree_hex>.json`, `provision.sh`
-copies them into `registration_program_id` / `merkle_program_id`, and `stage.sh`'s `env.sh`
-exports them as `LEZ_RLN_REGISTRATION_PROGRAM_ID` / `LEZ_RLN_MERKLE_PROGRAM_ID`, which every
-tool reads in preference to the record.
+`run_setup` writes it to `~/.logos-lez-rln/programs_<tree_hex>.json`, `provision.sh` copies it
+into `registration_program_id`, and `stage.sh`'s `env.sh` exports it as
+`LEZ_RLN_REGISTRATION_PROGRAM_ID`, which every tool reads in preference to the record.
 
-`tree_id` and the registration program id together determine `config` and `tree_main`, which
-are **derived** PDAs of `(registration_program_id, tree_id)`; `payer_account` is a **pointer
+There is no merkle program and no tree account: the registration program emits one event per
+successful action, and readers rebuild the membership tree from them (`lez-rln/src/zone`). A
+descriptor that still names a `merkle_program_id` is an on-chain-tree deployment whose
+144-byte config this program cannot read, and `stage.sh` refuses it.
+
+`tree_id` and the registration program id together determine `config`, a **derived** PDA of
+`(registration_program_id, tree_id)`; `payer_account` is a **pointer
 into the wallet**. `treasury_account` is neither — it is a plain account created at
 provisioning time, so the descriptor is the only record of where a registry's revenue
 accrues. A stale `config` can't silently disagree with the ids (`verify.sh`). All scripts are
@@ -71,8 +74,8 @@ bash tools/deployments/stage.sh <deployment_dir> <out_dir>
 Emits the flat files `run_setup`/`register_member`/node daemons already expect
 (`storage.json.seed`, `wallet_config.json`, `config_account.txt`,
 `payer_account.txt`, `treasury_account.txt`, `env.sh`). `env.sh` exports
-`LEE_WALLET_HOME_DIR`, `LEZ_RLN_TREE_ID_HEX`, `LEZ_RLN_PAYER` and both program ids.
-Requires both program ids as 64-hex fields, asserts the wallet has
+`LEE_WALLET_HOME_DIR`, `LEZ_RLN_TREE_ID_HEX`, `LEZ_RLN_PAYER` and the program id.
+Requires the program id as a 64-hex field, asserts the wallet has
 `key_chain.accounts`, and that it actually contains the descriptor's payer account —
 a mismatched wallet fails at stage time, not at runtime. The treasury is only ever
 credited, so no wallet need hold it.
@@ -91,8 +94,8 @@ credited, so no wallet need hold it.
 # payer's balance must cover gas_limit x base fee per transaction.
 bash tools/deployments/provision.sh --name my-run --payer <account-id>
 
-# reuse programs already on the chain: export their header ids first.
-LEZ_RLN_REGISTRATION_PROGRAM_ID=<64hex> LEZ_RLN_MERKLE_PROGRAM_ID=<64hex> \
+# reuse a program already on the chain: export its header id first.
+LEZ_RLN_REGISTRATION_PROGRAM_ID=<64hex> \
   bash tools/deployments/provision.sh --name my-run --payer <account-id>
 
 # reuse another sim's wallet (shared accounts), specific tree, write into a consumer repo:

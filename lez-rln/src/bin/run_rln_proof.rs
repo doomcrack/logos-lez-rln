@@ -1,14 +1,19 @@
-//! End-to-end RLN proof demo. Requires `run_setup` to have been run first.
+//! End-to-end RLN proof demo. Requires `run_setup` to have been run first,
+//! and `LEZ_RLN_INDEXER_URL` to name an indexer serving the program's events:
+//! the membership tree is rebuilt from them, not read from chain.
 
 use logos_lez_rln::{
     fr_bytes::fr_to_bytes_le,
-    merkle_tree::{get_merkle_proof, proof_to_circuit},
     rln::{
         client::{
             RlnIdentity, create_identity, init_wallet, register_identity, resolve_payer,
-            tree_id_from_env,
+            tree_id_from_env, wait_account_attempts,
         },
         program_ids_or_exit,
+    },
+    zone::{
+        indexer::{indexer_url_from_env, wait_for_member},
+        proof_to_circuit,
     },
 };
 use rln::prelude::{Fr, Hasher, PoseidonHash, RLNWitnessInput, hash_to_field_le};
@@ -24,6 +29,10 @@ const RLN_IDENTIFIER: &str = "rln/logos-rln-relay/v2.0.0";
 async fn main() {
     let tree_id = tree_id_from_env();
     let programs = program_ids_or_exit(&tree_id);
+    let indexer_url = indexer_url_from_env().unwrap_or_else(|| {
+        eprintln!("LEZ_RLN_INDEXER_URL must name the LEZ indexer serving the program's events");
+        std::process::exit(2);
+    });
     let mut wallet_core = init_wallet().await;
 
     println!("=== RLN Proof Demo ===\n");
@@ -45,7 +54,7 @@ async fn main() {
 
     // Step 2: Register via the registration program
     println!("\nStep 2: Registering...");
-    let leaf_index = register_identity(
+    let registration = register_identity(
         &wallet_core,
         &programs,
         &tree_id,
@@ -54,17 +63,33 @@ async fn main() {
         USER_MESSAGE_LIMIT,
     )
     .await
-    .expect("Timeout waiting for leaf to appear on-chain");
-    println!("  Registered at index: {}", leaf_index);
+    .expect("Timeout waiting for the membership to appear on-chain");
+    println!("  Registered at leaf index {}", registration.leaf_index);
 
-    // Step 3: Get the merkle proof from chain
-    println!("\nStep 3: Fetching merkle proof...");
-    let proof = get_merkle_proof(&wallet_core, &programs, &tree_id, leaf_index).await;
+    // Step 3: Rebuild the tree from the program's events and prove membership
+    println!("\nStep 3: Rebuilding the membership tree from events...");
+    let set = wait_for_member(
+        &indexer_url,
+        &programs.registration,
+        &tree_id,
+        &id_commitment_bytes,
+        wait_account_attempts(),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("{e}"));
+    let leaf_index = set
+        .leaf_index_of(&id_commitment_bytes)
+        .expect("the member was just found");
+    assert_eq!(
+        leaf_index, registration.leaf_index,
+        "the reader placed the member at another leaf than the chain assigned"
+    );
+    let proof = set.proof(leaf_index);
     let (merkle_proof, root) = proof_to_circuit(&proof);
 
     assert_eq!(
         leaf_bytes, proof.leaf,
-        "Leaf mismatch - transaction may not be finalized"
+        "Leaf mismatch - the reader's leaf is not this identity's rate commitment"
     );
 
     // Step 4: Generate RLN proof
@@ -120,8 +145,8 @@ async fn main() {
     }
 
     println!("\n=== Summary ===");
-    println!("Identity inserted at index: {}", leaf_index);
-    println!("On-chain root: {}", hex::encode(fr_to_bytes_le(&root)));
+    println!("Identity at leaf index: {}", leaf_index);
+    println!("Membership root: {}", hex::encode(fr_to_bytes_le(&root)));
     println!("Proof valid: {}", is_valid);
 
     if !is_valid {

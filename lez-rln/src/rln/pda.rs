@@ -6,11 +6,6 @@
 
 use nssa::AccountId;
 
-// `tree_main` is a PDA of the registration program's id, but its canonical
-// derivation lives next to the merkle program's other client code.
-pub use crate::merkle_tree::derive_main_account as derive_tree_main_account;
-// `spel_seeds` is a leaf module so both this and `merkle_tree::pda` can depend
-// on it without a cross-module cycle.
 pub use crate::spel_seeds::{combine_seeds, derive_pda, label_seed};
 
 /// Config account: `seeds = [literal("config"), arg("tree_id")]`.
@@ -77,15 +72,11 @@ mod tests {
     fn all_pda_types_are_distinct() {
         let p = mock_program_id();
         let t = tree_id_a();
-        let config = derive_config_account(&p, &t);
-        let main = derive_tree_main_account(&p, &t);
-        let mem = derive_membership_account(&p, &t, &[3u8; 32]);
-        let all = [&config, &main, &mem];
-        for (i, a) in all.iter().enumerate() {
-            for b in all.iter().skip(i + 1) {
-                assert_ne!(a, b, "PDA types must be distinct");
-            }
-        }
+        assert_ne!(
+            derive_config_account(&p, &t),
+            derive_membership_account(&p, &t, &[3u8; 32]),
+            "PDA types must be distinct"
+        );
     }
 
     #[test]

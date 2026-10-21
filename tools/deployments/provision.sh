@@ -12,13 +12,13 @@
 # other than this repo's deployments/ (e.g. a consumer's build context). Writes
 # {deployment.json, storage.json} and runs verify.sh.
 #
-# Program ids are deployment state: each program's account id is the header
+# The program id is deployment state: the program's account id is the header
 # account run_setup creates and signs, not a function of the guest .bin.
-# run_setup records both in $HOME/.logos-lez-rln/programs_<tree>.json; this
-# script copies them into deployment.json as registration_program_id and
-# merkle_program_id. To reuse programs already on the chain, export
-# LEZ_RLN_REGISTRATION_PROGRAM_ID / LEZ_RLN_MERKLE_PROGRAM_ID (64 hex each)
-# before running; run_setup then deploys only what those do not name.
+# run_setup records it in $HOME/.logos-lez-rln/programs_<tree>.json; this
+# script copies it into deployment.json as registration_program_id. To reuse a
+# program already on the chain, export LEZ_RLN_REGISTRATION_PROGRAM_ID (64
+# hex) before running; run_setup then deploys nothing. There is no merkle
+# program: the registration program emits events and readers keep the tree.
 #
 # There is no funding policy left to choose. A membership is paid for in the
 # NATIVE asset by the account that signs the Register transaction, which is
@@ -72,12 +72,12 @@ fi
 # Triple-shape sequencer field — see stage.sh: `sequencer` (v0.3.1 wallet),
 # `sequencers` (v0.3.0), flat `sequencer_addr` (module). calibration_limit: see
 # stage.sh — opening the wallet probes calibration_limit times (default 100).
-# gas_limit: the wallet's own default is 2,000,000, and a registration costs
-# about 9.1M — an on-chain merkle insert is one Poseidon compression, roughly
-# 902,000 cycles, per level of tree depth, and gas is cycles. A wallet that
-# declares too little has its transaction refused for running out of gas, with
-# nothing in the reply naming the limit it hit. MAX_GAS_EXEC (10M) is the
-# ceiling the protocol enforces; declaring more is refused outright.
+# gas_limit: the wallet's own default is 2,000,000. Gas is cycles; a slash
+# hashes the identity secret (one Poseidon compression, roughly 900,000
+# cycles), and a wallet that declares too little has its transaction refused
+# for running out of gas, with nothing in the reply naming the limit it hit.
+# MAX_GAS_EXEC (10M) is the ceiling the protocol enforces; declaring more is
+# refused outright.
 # The wallet declares this gas_limit on every transaction it sends, including
 # run_setup's own deploy and init txs, so the payer's reserve must cover
 # gas_limit x base fee for each. LEZ_RLN_GAS_LIMIT (default 10,000,000)
@@ -97,9 +97,7 @@ CFG=$(grep -E "^Config account:" "$LOG" | awk '{print $NF}')
 RECORD="$WS/.logos-lez-rln/programs_${TREE}.json"
 [ -f "$RECORD" ] || { echo "provision: FAIL: run_setup wrote no program record at $RECORD" >&2; exit 1; }
 REG=$(jq -re .registration_program_id "$RECORD")
-MRK=$(jq -re .merkle_program_id "$RECORD")
 [ "$(grep -E "^Registration program:" "$LOG" | awk '{print $NF}')" = "$REG" ] || { echo "provision: FAIL: run_setup's registration program != recorded $REG" >&2; exit 1; }
-[ "$(grep -E "^Merkle program:" "$LOG" | awk '{print $NF}')" = "$MRK" ] || { echo "provision: FAIL: run_setup's merkle program != recorded $MRK" >&2; exit 1; }
 PAY=$(tr -d '\n\r' < "$WS/.logos-lez-rln/payment_account_${TREE}.txt")
 # The treasury is created during setup and is not derivable — it is a plain
 # wallet account, not a PDA — so the descriptor is the only record of where a
@@ -109,16 +107,16 @@ TREASURY=$(grep -E "^  Treasury:" "$LOG" | awk '{print $NF}')
 
 DERIVED=$(cd "$LEZ" && "$DERIVE")
 dget(){ echo "$DERIVED" | jq -r ".$1"; }
-[ "$(dget registration_program_id)" = "$REG" ] && [ "$(dget merkle_program_id)" = "$MRK" ] || { echo "provision: FAIL: derive_accounts program ids != recorded ids" >&2; exit 1; }
+[ "$(dget registration_program_id)" = "$REG" ] || { echo "provision: FAIL: derive_accounts program id != recorded id" >&2; exit 1; }
 [ "$(dget config_account)" = "$CFG" ] || { echo "provision: FAIL: derived config != run_setup config" >&2; exit 1; }
 
 DEP_DIR="$OUTROOT/$NAME"; mkdir -p "$DEP_DIR"
 cp "$WS/storage.json" "$DEP_DIR/storage.json"
 jq -n \
   --arg name "$NAME" --arg tree "$TREE" --arg seq "$SEQUENCER" \
-  --arg reg "$REG" --arg mrk "$MRK" \
+  --arg reg "$REG" \
   --arg cfg "$CFG" --arg pay "$PAY" --arg treasury "$TREASURY" \
-  '{name:$name, tree_id:$tree, sequencer:$seq, registration_program_id:$reg, merkle_program_id:$mrk, config_account:$cfg, payer_account:$pay, treasury_account:$treasury}' \
+  '{name:$name, tree_id:$tree, sequencer:$seq, registration_program_id:$reg, config_account:$cfg, payer_account:$pay, treasury_account:$treasury}' \
   > "$DEP_DIR/deployment.json"
 
 echo "provision: wrote $DEP_DIR/{deployment.json,storage.json}"

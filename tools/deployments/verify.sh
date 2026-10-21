@@ -28,14 +28,14 @@ export DYLD_FRAMEWORK_PATH="${DYLD_FRAMEWORK_PATH:-/Library/Developer/CommandLin
   build: (cd $REPO/lez-rln && PYO3_PYTHON=\$(command -v python3) cargo build --release --bin derive_accounts)" >&2; exit 1; }
 
 f(){ jq -re ".$1" "$DEP_DIR/deployment.json"; }
-TREE=$(f tree_id); WANT_REG=$(f registration_program_id); WANT_MRK=$(f merkle_program_id); WANT_CFG=$(f config_account)
+TREE=$(f tree_id); WANT_REG=$(f registration_program_id); WANT_CFG=$(f config_account)
 
 fail(){ echo "verify: FAIL: $1" >&2; exit 1; }
 
 # The descriptor's ids go in through the env overrides, so derive_accounts
 # reads them instead of whatever record the running HOME holds.
 DERIVED=$(cd "$REPO/lez-rln" && LEZ_RLN_TREE_ID_HEX="$TREE" \
-  LEZ_RLN_REGISTRATION_PROGRAM_ID="$WANT_REG" LEZ_RLN_MERKLE_PROGRAM_ID="$WANT_MRK" "$DERIVE")
+  LEZ_RLN_REGISTRATION_PROGRAM_ID="$WANT_REG" "$DERIVE")
 GOT_CFG=$(echo "$DERIVED" | jq -r .config_account)
 [ "$GOT_CFG" = "$WANT_CFG" ] || fail "config account mismatch (tree_id/program_id inconsistent)
   descriptor: $WANT_CFG
@@ -43,16 +43,13 @@ GOT_CFG=$(echo "$DERIVED" | jq -r .config_account)
 
 RECORD="${HOME:-.}/.logos-lez-rln/programs_${TREE}.json"
 if [ -f "$RECORD" ]; then
-  REC_REG=$(jq -re .registration_program_id "$RECORD"); REC_MRK=$(jq -re .merkle_program_id "$RECORD")
+  REC_REG=$(jq -re .registration_program_id "$RECORD")
   [ "$REC_REG" = "$WANT_REG" ] || fail "registration program id differs from the record $RECORD
   descriptor: $WANT_REG
   record:     $REC_REG"
-  [ "$REC_MRK" = "$WANT_MRK" ] || fail "merkle program id differs from the record $RECORD
-  descriptor: $WANT_MRK
-  record:     $REC_MRK"
-  RECORD_NOTE="program ids match $RECORD"
+  RECORD_NOTE="program id matches $RECORD"
 else
-  RECORD_NOTE="no record at $RECORD (program ids not cross-checked)"
+  RECORD_NOTE="no record at $RECORD (program id not cross-checked)"
 fi
 
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT

@@ -1,33 +1,38 @@
 //! The RLN registration program: `plan` turns an instruction plus account
-//! metadata into shard effects and chained calls; `apply` runs one effect
-//! against one shard's bytes.
+//! metadata into shard effects, chained calls and events; `apply` runs one
+//! effect against one shard's bytes.
 //!
 //! Plan sees no account data, so every stored value an instruction depends on
 //! travels in it as a claim (see `rln_layouts::instruction`). Each claim is
 //! asserted by the apply of the shard that stores it; a wrong claim fails the
-//! transaction, and with it every chained call the plan emitted.
+//! transaction, and with it every chained call and event the plan emitted.
+//!
+//! There is no on-chain membership tree. Each successful action emits one
+//! `rln_layouts::events` event, built only from asserted claims, and readers
+//! rebuild the tree from those events in block order.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use nssa_core::{
     account::{AccountId, ProgramShardSelector},
     native_token::{self, NATIVE_TOKEN_PROGRAM_ID},
-    program::{AccountMeta, ChainedCall, PdaSeed, Plan, PlanInput},
+    program::{AccountMeta, ChainedCall, PdaSeed, Plan, PlanInput, ProgramEvent},
 };
 use rln_layouts::{
-    ConfigState, Instruction, MembershipState, MerkleInstruction, combine_seeds,
+    ConfigState, Instruction, MembershipState, combine_seeds,
+    events::{Erased, Extended, Registered, Slashed},
     exit::{
         EXIT_MEMBERSHIP_EXISTS, EXIT_MEMBERSHIP_MISSING, EXIT_NOT_EXPIRED,
-        EXIT_NOT_IN_GRACE_PERIOD, EXIT_RATE_LIMIT_FULL, EXIT_STALE_CONFIG, EXIT_STALE_RATE_LIMIT,
+        EXIT_NOT_IN_GRACE_PERIOD, EXIT_RATE_LIMIT_FULL, EXIT_STALE_CONFIG, EXIT_STALE_EXPIRY,
+        EXIT_STALE_LEAF_INDEX, EXIT_STALE_RATE_LIMIT,
     },
-    is_expired, is_in_grace_period, label_seed, secs_to_millis,
+    expiry_ms, is_expired, is_in_grace_period, label_seed, secs_to_millis,
 };
 
 use crate::{
     ensure,
     hash::{hash_single, validate_field_element},
     registration::{
-        assert_clock_is, calculate_payment_amount, compute_registration_leaf,
-        require_clock_account, validate_rate_limit,
+        assert_clock_is, calculate_payment_amount, require_clock_account, validate_rate_limit,
     },
 };
 
@@ -38,34 +43,25 @@ use crate::{
 pub enum Effect {
     /// Config shard: write the initial config. One-shot.
     InitConfig(ConfigState),
-    /// Config shard: assert the claimed ids; keep.
-    InitTreeGuard {
-        tree_id: [u8; 32],
-        merkle_program_id: [u8; 32],
-    },
     /// Config shard: assert every claim a registration relies on, then count
-    /// the new member.
+    /// the new member and advance `next_leaf_index`.
     RegisterConfig {
         tree_id: [u8; 32],
-        merkle_program_id: [u8; 32],
         price_per_unit: u128,
         treasury: [u8; 32],
         rate_limit: u64,
         active_duration_sec: u32,
         grace_period_duration_sec: u32,
+        leaf_index: u64,
     },
     /// Membership shard: write the new membership. One-shot.
     InitMembership(MembershipState),
     /// Clock shard (foreign, read-only): the claim is at most
     /// `CLOCK_CLAIM_TOLERANCE_MS` behind its timestamp, never ahead.
     ClockIs(u64),
-    /// Config shard: assert the claimed ids, then uncount a member of
+    /// Config shard: assert the tree id, then uncount a member of
     /// `rate_limit` (slash, erase).
-    ReleaseConfig {
-        tree_id: [u8; 32],
-        merkle_program_id: [u8; 32],
-        rate_limit: u64,
-    },
+    ReleaseConfig { tree_id: [u8; 32], rate_limit: u64 },
     /// Membership shard: assert the claims, then clear.
     SlashMembership {
         id_commitment: [u8; 32],
@@ -77,8 +73,12 @@ pub enum Effect {
         price_per_unit: u128,
         treasury: [u8; 32],
     },
-    /// Membership shard: assert the claim and the grace window, then renew.
-    ExtendMembership { now_ms: u64, rate_limit: u64 },
+    /// Membership shard: assert the claims and the grace window, then renew.
+    ExtendMembership {
+        now_ms: u64,
+        rate_limit: u64,
+        expiry_timestamp_ms: u64,
+    },
     /// Membership shard: assert the claim and expiry, then clear.
     EraseMembership { now_ms: u64, rate_limit: u64 },
 }
@@ -87,10 +87,6 @@ pub enum Effect {
 
 pub fn config_seed(tree_id: &[u8; 32]) -> [u8; 32] {
     combine_seeds(&[&label_seed("config"), tree_id])
-}
-
-pub fn main_seed(tree_id: &[u8; 32]) -> [u8; 32] {
-    combine_seeds(&[&label_seed("main"), tree_id])
 }
 
 pub fn membership_seed(tree_id: &[u8; 32], id_commitment: &[u8; 32]) -> [u8; 32] {
@@ -120,47 +116,7 @@ fn require_own_pda(input: &PlanInput, meta: &AccountMeta, seed: [u8; 32], what: 
     );
 }
 
-/// `tree_main` is the merkle program's shard of this program's `main` PDA.
-fn require_tree_main(
-    input: &PlanInput,
-    tree_main: &AccountMeta,
-    tree_id: &[u8; 32],
-    merkle_program_id: &[u8; 32],
-) {
-    assert!(
-        tree_main.account_id == pda(input, main_seed(tree_id)),
-        "Wrong tree_main PDA"
-    );
-    assert!(
-        tree_main.program_account_id == AccountId::new(*merkle_program_id),
-        "tree_main must select the merkle program's shard"
-    );
-}
-
 // ─── chained calls ─────────────────────────────────────────────────────
-
-/// Call the merkle program on `tree_main`, granting it this program's `main`
-/// PDA.
-///
-/// `merkle_program_id` is a claim, and the seeds make its program the owner
-/// of the tree. Every caller of this function also plans a config effect
-/// that asserts the claim against the config's stored `merkle_program_id`,
-/// so a caller-named program id fails the transaction instead of receiving
-/// the grant. Never emit this call without that effect.
-fn merkle_call(
-    merkle_program_id: [u8; 32],
-    tree_main: &AccountMeta,
-    tree_id: &[u8; 32],
-    instruction: &MerkleInstruction,
-) -> ChainedCall {
-    let merkle = AccountId::new(merkle_program_id);
-    ChainedCall::new(
-        merkle,
-        vec![ProgramShardSelector::new(tree_main.account_id, merkle)],
-        instruction,
-    )
-    .with_pda_seeds(vec![PdaSeed::new(main_seed(tree_id))])
-}
 
 /// Move `amount` of the native asset from `payer` to `treasury`. The native
 /// program refuses an unauthorized sender and an insufficient balance; the
@@ -182,22 +138,23 @@ fn native_payment(payer: &AccountMeta, treasury: &AccountMeta, amount: u128) -> 
 ///
 /// Accounts, in order:
 /// - `Initialize`: `[config]`
-/// - `InitializeMerkleTree`: `[config, tree_main]`
-/// - `Register`: `[config, tree_main, payer, treasury, clock, membership]`
-/// - `Slash`: `[config, tree_main, membership]`
+/// - `Register`: `[config, payer, treasury, clock, membership]`
+/// - `Slash`: `[config, membership]`
 /// - `Extend`: `[config, membership, payer, treasury, clock]`
-/// - `Erase`: `[config, tree_main, membership, clock]`
+/// - `Erase`: `[config, membership, clock]`
 ///
 /// `config` and `membership` select this program's shard of their PDAs,
-/// `tree_main` the merkle program's shard of this program's `main` PDA,
 /// `clock` the clock program's shard of `CLOCK_50`. `payer` must be
 /// authorized; `payer` and `treasury` are paid through their native shards,
 /// whatever shard their metadata selects.
+///
+/// Every instruction but `Initialize` emits exactly one event, last. Each of
+/// its fields is an argument the plan validated or a claim an apply asserts,
+/// so a transaction that emits it is one whose every claim held.
 pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
     let mut plan = Plan::new(input);
     match instruction {
         Instruction::Initialize {
-            merkle_program_id,
             tree_id,
             price_per_unit,
             treasury_account_id,
@@ -218,7 +175,6 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
             plan.effect(
                 config,
                 &Effect::InitConfig(ConfigState {
-                    merkle_program_id,
                     tree_id,
                     price_per_unit,
                     treasury_account_id,
@@ -227,50 +183,29 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
                     current_total_rate_limit: 0,
                     active_duration_for_new_memberships_sec,
                     grace_period_duration_for_new_memberships_sec,
+                    next_leaf_index: 0,
                 }),
             );
-        }
-        Instruction::InitializeMerkleTree {
-            tree_id,
-            merkle_program_id,
-        } => {
-            let [config, tree_main] = accounts(input, "InitializeMerkleTree");
-            require_own_pda(input, config, config_seed(&tree_id), "config");
-            require_tree_main(input, tree_main, &tree_id, &merkle_program_id);
-            plan.effect(
-                config,
-                &Effect::InitTreeGuard {
-                    tree_id,
-                    merkle_program_id,
-                },
-            );
-            // One-shot: the merkle program's Initialize refuses a tree shard
-            // that already holds data, so a replay cannot reset a live tree.
-            plan.call(merkle_call(
-                merkle_program_id,
-                tree_main,
-                &tree_id,
-                &MerkleInstruction::Initialize,
-            ));
         }
         Instruction::Register {
             tree_id,
             id_commitment,
             rate_limit,
-            merkle_program_id,
             now_ms,
             price_per_unit,
             active_duration_sec,
             grace_period_duration_sec,
+            leaf_index,
         } => {
-            let [config, tree_main, payer, treasury, clock, membership] =
-                accounts(input, "Register");
+            let [config, payer, treasury, clock, membership] = accounts(input, "Register");
+            // Readers hash `(id_commitment, rate_limit)` into a Poseidon leaf,
+            // so the commitment must be a BN254 field element; the program
+            // itself no longer hashes it.
             validate_field_element(&id_commitment);
             // Zero is the empty-leaf value and no identity secret hashes to it.
             assert!(id_commitment != [0u8; 32], "id_commitment must not be zero");
             validate_rate_limit(rate_limit);
             require_own_pda(input, config, config_seed(&tree_id), "config");
-            require_tree_main(input, tree_main, &tree_id, &merkle_program_id);
             require_own_pda(
                 input,
                 membership,
@@ -280,16 +215,18 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
             require_clock_account(clock);
             assert!(payer.is_authorized, "Payer must authorize payment");
 
+            let grace_period_start_timestamp_ms =
+                now_ms.saturating_add(secs_to_millis(active_duration_sec));
             plan.effect(
                 config,
                 &Effect::RegisterConfig {
                     tree_id,
-                    merkle_program_id,
                     price_per_unit,
                     treasury: *treasury.account_id.value(),
                     rate_limit,
                     active_duration_sec,
                     grace_period_duration_sec,
+                    leaf_index,
                 },
             );
             plan.inspect(clock, clock.program_account_id, &Effect::ClockIs(now_ms));
@@ -298,8 +235,7 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
                 &Effect::InitMembership(MembershipState {
                     rate_limit,
                     id_commitment,
-                    grace_period_start_timestamp_ms: now_ms
-                        .saturating_add(secs_to_millis(active_duration_sec)),
+                    grace_period_start_timestamp_ms,
                     active_duration_sec,
                     grace_period_duration_sec,
                 }),
@@ -309,27 +245,28 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
                 treasury,
                 calculate_payment_amount(rate_limit, price_per_unit),
             ));
-            // The tree picks the index (its `next_index`) and refuses a full
-            // tree; nothing here names one, so registrations planned against
-            // the same tree state do not contend.
-            plan.call(merkle_call(
-                merkle_program_id,
-                tree_main,
-                &tree_id,
-                &MerkleInstruction::Insert {
-                    leaf: compute_registration_leaf(&id_commitment, rate_limit),
-                },
+            plan.event(event(
+                Registered::SELECTOR,
+                Registered {
+                    tree_id,
+                    id_commitment,
+                    rate_limit,
+                    expiry_timestamp_ms: expiry_ms(
+                        grace_period_start_timestamp_ms,
+                        secs_to_millis(grace_period_duration_sec),
+                    ),
+                    leaf_index,
+                }
+                .to_bytes(),
             ));
         }
         Instruction::Slash {
             tree_id,
             id_commitment,
             identity_secret,
-            merkle_program_id,
-            leaf_index,
             rate_limit,
         } => {
-            let [config, tree_main, membership] = accounts(input, "Slash");
+            let [config, membership] = accounts(input, "Slash");
             validate_field_element(&identity_secret);
             assert_eq!(
                 hash_single(&identity_secret),
@@ -337,7 +274,6 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
                 "id_commitment arg must match hash(identity_secret)"
             );
             require_own_pda(input, config, config_seed(&tree_id), "config");
-            require_tree_main(input, tree_main, &tree_id, &merkle_program_id);
             require_own_pda(
                 input,
                 membership,
@@ -349,7 +285,6 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
                 config,
                 &Effect::ReleaseConfig {
                     tree_id,
-                    merkle_program_id,
                     rate_limit,
                 },
             );
@@ -360,17 +295,13 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
                     rate_limit,
                 },
             );
-            // `leaf_index` is a hint; the merkle apply removes it only if it
-            // holds this membership's leaf, whose `rate_limit` the membership
-            // apply has just asserted.
-            plan.call(merkle_call(
-                merkle_program_id,
-                tree_main,
-                &tree_id,
-                &MerkleInstruction::Remove {
-                    index: leaf_index,
-                    leaf: compute_registration_leaf(&id_commitment, rate_limit),
-                },
+            plan.event(event(
+                Slashed::SELECTOR,
+                Slashed {
+                    tree_id,
+                    id_commitment,
+                }
+                .to_bytes(),
             ));
         }
         // Renewal is priced, not permissioned: the membership records no
@@ -385,6 +316,7 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
             now_ms,
             price_per_unit,
             rate_limit,
+            expiry_timestamp_ms,
         } => {
             let [config, membership, payer, treasury, clock] = accounts(input, "Extend");
             require_own_pda(input, config, config_seed(&tree_id), "config");
@@ -406,24 +338,37 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
                 },
             );
             plan.inspect(clock, clock.program_account_id, &Effect::ClockIs(now_ms));
-            plan.effect(membership, &Effect::ExtendMembership { now_ms, rate_limit });
+            plan.effect(
+                membership,
+                &Effect::ExtendMembership {
+                    now_ms,
+                    rate_limit,
+                    expiry_timestamp_ms,
+                },
+            );
             plan.call(native_payment(
                 payer,
                 treasury,
                 calculate_payment_amount(rate_limit, price_per_unit),
             ));
+            plan.event(event(
+                Extended::SELECTOR,
+                Extended {
+                    tree_id,
+                    id_commitment,
+                    expiry_timestamp_ms,
+                }
+                .to_bytes(),
+            ));
         }
         Instruction::Erase {
             tree_id,
             id_commitment,
-            merkle_program_id,
-            leaf_index,
             rate_limit,
             now_ms,
         } => {
-            let [config, tree_main, membership, clock] = accounts(input, "Erase");
+            let [config, membership, clock] = accounts(input, "Erase");
             require_own_pda(input, config, config_seed(&tree_id), "config");
-            require_tree_main(input, tree_main, &tree_id, &merkle_program_id);
             require_own_pda(
                 input,
                 membership,
@@ -436,25 +381,26 @@ pub fn plan(input: &PlanInput, instruction: Instruction) -> Plan {
                 config,
                 &Effect::ReleaseConfig {
                     tree_id,
-                    merkle_program_id,
                     rate_limit,
                 },
             );
             plan.inspect(clock, clock.program_account_id, &Effect::ClockIs(now_ms));
             plan.effect(membership, &Effect::EraseMembership { now_ms, rate_limit });
-            // As for Slash: the index is checked by content.
-            plan.call(merkle_call(
-                merkle_program_id,
-                tree_main,
-                &tree_id,
-                &MerkleInstruction::Remove {
-                    index: leaf_index,
-                    leaf: compute_registration_leaf(&id_commitment, rate_limit),
-                },
+            plan.event(event(
+                Erased::SELECTOR,
+                Erased {
+                    tree_id,
+                    id_commitment,
+                }
+                .to_bytes(),
             ));
         }
     }
     plan
+}
+
+fn event(selector: [u8; 8], data: Vec<u8>) -> ProgramEvent {
+    ProgramEvent { selector, data }
 }
 
 // ─── apply ─────────────────────────────────────────────────────────────
@@ -474,15 +420,8 @@ fn decode_membership(pre_data: &[u8], empty_msg: &str) -> MembershipState {
     MembershipState::try_from_slice(pre_data).expect("decode MembershipState")
 }
 
-/// The config is the only source of the callee program id: the claimed
-/// `merkle_program_id` that a chained call targets, with this program's
-/// `main` PDA seed attached, must be the one stored at initialization.
-fn assert_config_ids(config: &ConfigState, tree_id: &[u8; 32], merkle_program_id: &[u8; 32]) {
+fn assert_tree_id(config: &ConfigState, tree_id: &[u8; 32]) {
     assert!(config.tree_id == *tree_id, "tree_id arg must match config");
-    assert!(
-        config.merkle_program_id == *merkle_program_id,
-        "merkle_program_id claim must match config"
-    );
 }
 
 /// Apply one effect to its shard's bytes. `None` keeps the shard; `Some`
@@ -499,24 +438,17 @@ pub fn apply(effect: Effect, pre_data: &[u8]) -> Option<Vec<u8>> {
             );
             Some(encode(&state))
         }
-        Effect::InitTreeGuard {
-            tree_id,
-            merkle_program_id,
-        } => {
-            assert_config_ids(&decode_config(pre_data), &tree_id, &merkle_program_id);
-            None
-        }
         Effect::RegisterConfig {
             tree_id,
-            merkle_program_id,
             price_per_unit,
             treasury,
             rate_limit,
             active_duration_sec,
             grace_period_duration_sec,
+            leaf_index,
         } => {
             let mut config = decode_config(pre_data);
-            assert_config_ids(&config, &tree_id, &merkle_program_id);
+            assert_tree_id(&config, &tree_id);
             ensure!(
                 config.price_per_unit == price_per_unit,
                 EXIT_STALE_CONFIG,
@@ -542,15 +474,23 @@ pub fn apply(effect: Effect, pre_data: &[u8]) -> Option<Vec<u8>> {
                 EXIT_RATE_LIMIT_FULL,
                 "Would exceed max total rate limit"
             );
+            // The `Registered` event carries the claim; this is what makes it
+            // the index no other registration has taken.
+            ensure!(
+                config.next_leaf_index == leaf_index,
+                EXIT_STALE_LEAF_INDEX,
+                "leaf_index claim must match config"
+            );
+            config.next_leaf_index = config.next_leaf_index.saturating_add(1);
             config.total_registrations = config.total_registrations.saturating_add(1);
             config.current_total_rate_limit =
                 config.current_total_rate_limit.saturating_add(rate_limit);
             Some(encode(&config))
         }
         // One-shot, and the only duplicate-registration guard: the membership
-        // PDA is derived from the id_commitment, and neither the register plan
-        // nor the merkle insert dedupes. Weaken this check and re-registering
-        // a commitment silently overwrites its membership.
+        // PDA is derived from the id_commitment, and the register plan does
+        // not dedupe. Weaken this check and re-registering a commitment
+        // silently overwrites its membership and emits a second `Registered`.
         Effect::InitMembership(state) => {
             ensure!(
                 pre_data.is_empty(),
@@ -565,11 +505,10 @@ pub fn apply(effect: Effect, pre_data: &[u8]) -> Option<Vec<u8>> {
         }
         Effect::ReleaseConfig {
             tree_id,
-            merkle_program_id,
             rate_limit,
         } => {
             let mut config = decode_config(pre_data);
-            assert_config_ids(&config, &tree_id, &merkle_program_id);
+            assert_tree_id(&config, &tree_id);
             config.current_total_rate_limit =
                 config.current_total_rate_limit.saturating_sub(rate_limit);
             config.total_registrations = config.total_registrations.saturating_sub(1);
@@ -600,7 +539,7 @@ pub fn apply(effect: Effect, pre_data: &[u8]) -> Option<Vec<u8>> {
             treasury,
         } => {
             let config = decode_config(pre_data);
-            assert!(config.tree_id == tree_id, "tree_id arg must match config");
+            assert_tree_id(&config, &tree_id);
             ensure!(
                 config.price_per_unit == price_per_unit,
                 EXIT_STALE_CONFIG,
@@ -613,7 +552,11 @@ pub fn apply(effect: Effect, pre_data: &[u8]) -> Option<Vec<u8>> {
             );
             None
         }
-        Effect::ExtendMembership { now_ms, rate_limit } => {
+        Effect::ExtendMembership {
+            now_ms,
+            rate_limit,
+            expiry_timestamp_ms,
+        } => {
             let mut membership = decode_membership(
                 pre_data,
                 "Membership account is empty - cannot extend a non-existent membership",
@@ -636,6 +579,16 @@ pub fn apply(effect: Effect, pre_data: &[u8]) -> Option<Vec<u8>> {
                 .grace_period_start_timestamp_ms
                 .saturating_add(secs_to_millis(membership.grace_period_duration_sec))
                 .saturating_add(secs_to_millis(membership.active_duration_sec));
+            // The `Extended` event carries the claim; this is what makes it
+            // the expiry the membership now has.
+            ensure!(
+                expiry_ms(
+                    membership.grace_period_start_timestamp_ms,
+                    secs_to_millis(membership.grace_period_duration_sec),
+                ) == expiry_timestamp_ms,
+                EXIT_STALE_EXPIRY,
+                "expiry_timestamp_ms claim must match the extended membership"
+            );
             Some(encode(&membership))
         }
         Effect::EraseMembership { now_ms, rate_limit } => {
@@ -663,18 +616,19 @@ pub fn apply(effect: Effect, pre_data: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use nssa_core::program::ShardEffect;
-    use rln_layouts::CLOCK_50_ACCOUNT_ID_BYTES;
+    use rln_layouts::{CLOCK_50_ACCOUNT_ID_BYTES, events::RlnEvent};
 
     use super::*;
 
     const SELF_ID: [u8; 32] = [0xA1; 32];
-    const MERKLE: [u8; 32] = [0xB2; 32];
     const TREE_ID: [u8; 32] = [0x07; 32];
     const TREASURY: [u8; 32] = [0x77; 32];
     const PAYER: [u8; 32] = [0x55; 32];
     const PRICE: u128 = 10;
     const ACTIVE_SEC: u32 = 100;
     const GRACE_SEC: u32 = 50;
+    /// The config's `next_leaf_index` in [`config_state`].
+    const LEAF: u64 = 5;
     const NOW_MS: u64 = 1_000_000;
     const RATE: u64 = 200;
 
@@ -698,10 +652,6 @@ mod tests {
 
     fn config_meta() -> AccountMeta {
         AccountMeta::new(pda_of(config_seed(&TREE_ID)), false, self_id())
-    }
-
-    fn tree_main_meta() -> AccountMeta {
-        AccountMeta::new(pda_of(main_seed(&TREE_ID)), false, AccountId::new(MERKLE))
     }
 
     fn membership_meta() -> AccountMeta {
@@ -739,7 +689,6 @@ mod tests {
 
     fn config_state() -> ConfigState {
         ConfigState {
-            merkle_program_id: MERKLE,
             tree_id: TREE_ID,
             price_per_unit: PRICE,
             treasury_account_id: TREASURY,
@@ -748,6 +697,7 @@ mod tests {
             current_total_rate_limit: 600,
             active_duration_for_new_memberships_sec: ACTIVE_SEC,
             grace_period_duration_for_new_memberships_sec: GRACE_SEC,
+            next_leaf_index: LEAF,
         }
     }
 
@@ -766,18 +716,17 @@ mod tests {
             tree_id: TREE_ID,
             id_commitment: commitment(),
             rate_limit: RATE,
-            merkle_program_id: MERKLE,
             now_ms: NOW_MS,
             price_per_unit: PRICE,
             active_duration_sec: ACTIVE_SEC,
             grace_period_duration_sec: GRACE_SEC,
+            leaf_index: LEAF,
         }
     }
 
     fn register_accounts() -> Vec<AccountMeta> {
         vec![
             config_meta(),
-            tree_main_meta(),
             payer_meta(true),
             treasury_meta(),
             clock_meta(),
@@ -785,16 +734,43 @@ mod tests {
         ]
     }
 
-    fn expected_merkle(ix: &MerkleInstruction) -> ChainedCall {
-        ChainedCall::new(
-            AccountId::new(MERKLE),
-            vec![ProgramShardSelector::new(
-                tree_main_meta().account_id,
-                AccountId::new(MERKLE),
-            )],
-            ix,
-        )
-        .with_pda_seeds(vec![PdaSeed::new(main_seed(&TREE_ID))])
+    fn extend_accounts(payer_authorized: bool) -> Vec<AccountMeta> {
+        vec![
+            config_meta(),
+            membership_meta(),
+            payer_meta(payer_authorized),
+            treasury_meta(),
+            clock_meta(),
+        ]
+    }
+
+    fn extend_ix(expiry_timestamp_ms: u64) -> Instruction {
+        Instruction::Extend {
+            tree_id: TREE_ID,
+            id_commitment: commitment(),
+            now_ms: NOW_MS,
+            price_per_unit: PRICE,
+            rate_limit: RATE,
+            expiry_timestamp_ms,
+        }
+    }
+
+    fn erase_ix() -> Instruction {
+        Instruction::Erase {
+            tree_id: TREE_ID,
+            id_commitment: commitment(),
+            rate_limit: RATE,
+            now_ms: NOW_MS,
+        }
+    }
+
+    fn slash_ix(identity_secret: [u8; 32]) -> Instruction {
+        Instruction::Slash {
+            tree_id: TREE_ID,
+            id_commitment: commitment(),
+            identity_secret,
+            rate_limit: RATE,
+        }
     }
 
     fn expected_payment(amount: u128) -> ChainedCall {
@@ -806,6 +782,19 @@ mod tests {
             ],
             &native_token::Instruction::Transfer { amount },
         )
+    }
+
+    /// The plan's events, decoded. `ProgramEvent` has no `PartialEq`.
+    fn events(plan: &Plan) -> Vec<RlnEvent> {
+        plan.output()
+            .events
+            .iter()
+            .map(|e| {
+                RlnEvent::decode(e.selector, &e.data)
+                    .expect("a selector this program emits")
+                    .expect("well-formed event data")
+            })
+            .collect()
     }
 
     fn clock_bytes(timestamp: u64) -> Vec<u8> {
@@ -826,10 +815,6 @@ mod tests {
             combine_seeds(&[&label_seed("config"), &TREE_ID])
         );
         assert_eq!(
-            main_seed(&TREE_ID),
-            combine_seeds(&[&label_seed("main"), &TREE_ID])
-        );
-        assert_eq!(
             membership_seed(&TREE_ID, &[1; 32]),
             combine_seeds(&[&label_seed("membership"), &TREE_ID, &[1; 32]])
         );
@@ -837,95 +822,44 @@ mod tests {
 
     // ─── plan ──────────────────────────────────────────────────────────
 
+    fn initialize_ix() -> Instruction {
+        Instruction::Initialize {
+            tree_id: TREE_ID,
+            price_per_unit: PRICE,
+            treasury_account_id: TREASURY,
+            max_total_rate_limit: 1_000,
+            active_duration_for_new_memberships_sec: ACTIVE_SEC,
+            grace_period_duration_for_new_memberships_sec: GRACE_SEC,
+        }
+    }
+
     #[test]
-    fn plan_initialize_emits_init_config() {
-        let input = input(vec![config_meta()]);
-        let plan = plan(
-            &input,
-            Instruction::Initialize {
-                merkle_program_id: MERKLE,
-                tree_id: TREE_ID,
-                price_per_unit: PRICE,
-                treasury_account_id: TREASURY,
-                max_total_rate_limit: 1_000,
-                active_duration_for_new_memberships_sec: ACTIVE_SEC,
-                grace_period_duration_for_new_memberships_sec: GRACE_SEC,
-            },
-        );
+    fn plan_initialize_emits_init_config_and_no_event() {
+        let plan = plan(&input(vec![config_meta()]), initialize_ix());
         let mut state = config_state();
         state.total_registrations = 0;
         state.current_total_rate_limit = 0;
+        state.next_leaf_index = 0;
         assert_eq!(
             plan.output().effects,
             vec![ShardEffect::new(&config_meta(), &Effect::InitConfig(state))]
         );
         assert!(plan.output().chained_calls.is_empty());
+        assert!(plan.output().events.is_empty());
     }
 
     #[test]
     #[should_panic(expected = "Wrong config PDA")]
     fn plan_initialize_rejects_foreign_config_pda() {
         let config = AccountMeta::new(AccountId::new([9; 32]), false, self_id());
-        let _ = plan(
-            &input(vec![config]),
-            Instruction::Initialize {
-                merkle_program_id: MERKLE,
-                tree_id: TREE_ID,
-                price_per_unit: PRICE,
-                treasury_account_id: TREASURY,
-                max_total_rate_limit: 1_000,
-                active_duration_for_new_memberships_sec: ACTIVE_SEC,
-                grace_period_duration_for_new_memberships_sec: GRACE_SEC,
-            },
-        );
+        let _ = plan(&input(vec![config]), initialize_ix());
     }
 
     #[test]
-    fn plan_initialize_merkle_tree_guards_config_then_calls_merkle() {
-        let plan = plan(
-            &input(vec![config_meta(), tree_main_meta()]),
-            Instruction::InitializeMerkleTree {
-                tree_id: TREE_ID,
-                merkle_program_id: MERKLE,
-            },
-        );
-        assert_eq!(
-            plan.output().effects,
-            vec![ShardEffect::new(
-                &config_meta(),
-                &Effect::InitTreeGuard {
-                    tree_id: TREE_ID,
-                    merkle_program_id: MERKLE
-                }
-            )]
-        );
-        assert_eq!(
-            plan.output().chained_calls,
-            vec![expected_merkle(&MerkleInstruction::Initialize)]
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "tree_main must select the merkle program's shard")]
-    fn plan_initialize_merkle_tree_rejects_tree_main_of_other_program() {
-        let tree_main = AccountMeta::new(
-            pda_of(main_seed(&TREE_ID)),
-            false,
-            AccountId::new([0xEE; 32]),
-        );
-        let _ = plan(
-            &input(vec![config_meta(), tree_main]),
-            Instruction::InitializeMerkleTree {
-                tree_id: TREE_ID,
-                merkle_program_id: MERKLE,
-            },
-        );
-    }
-
-    #[test]
-    fn plan_register_emits_effects_payment_then_insert() {
+    fn plan_register_emits_effects_payment_and_registered() {
         let plan = plan(&input(register_accounts()), register_ix());
         let out = plan.output();
+        let grace_start = NOW_MS + secs_to_millis(ACTIVE_SEC);
         assert_eq!(
             out.effects,
             vec![
@@ -933,29 +867,34 @@ mod tests {
                     &config_meta(),
                     &Effect::RegisterConfig {
                         tree_id: TREE_ID,
-                        merkle_program_id: MERKLE,
                         price_per_unit: PRICE,
                         treasury: TREASURY,
                         rate_limit: RATE,
                         active_duration_sec: ACTIVE_SEC,
                         grace_period_duration_sec: GRACE_SEC,
+                        leaf_index: LEAF,
                     }
                 ),
                 ShardEffect::new(&clock_meta(), &Effect::ClockIs(NOW_MS)),
                 ShardEffect::new(
                     &membership_meta(),
-                    &Effect::InitMembership(membership_state(NOW_MS + secs_to_millis(ACTIVE_SEC)))
+                    &Effect::InitMembership(membership_state(grace_start))
                 ),
             ]
         );
         assert_eq!(
             out.chained_calls,
-            vec![
-                expected_payment(u128::from(RATE) * PRICE),
-                expected_merkle(&MerkleInstruction::Insert {
-                    leaf: compute_registration_leaf(&commitment(), RATE),
-                }),
-            ]
+            vec![expected_payment(u128::from(RATE) * PRICE)]
+        );
+        assert_eq!(
+            events(&plan),
+            vec![RlnEvent::Registered(Registered {
+                tree_id: TREE_ID,
+                id_commitment: commitment(),
+                rate_limit: RATE,
+                expiry_timestamp_ms: grace_start + secs_to_millis(GRACE_SEC),
+                leaf_index: LEAF,
+            })]
         );
     }
 
@@ -965,7 +904,6 @@ mod tests {
         let Instruction::Register {
             tree_id,
             rate_limit,
-            merkle_program_id,
             now_ms,
             price_per_unit,
             active_duration_sec,
@@ -979,15 +917,41 @@ mod tests {
             tree_id,
             id_commitment: [0u8; 32],
             rate_limit,
-            merkle_program_id,
             now_ms,
             price_per_unit,
             active_duration_sec,
             grace_period_duration_sec,
+            leaf_index: LEAF,
         };
         let mut accounts = register_accounts();
-        accounts[5] = AccountMeta::new(
+        accounts[4] = AccountMeta::new(
             pda_of(membership_seed(&TREE_ID, &[0u8; 32])),
+            false,
+            self_id(),
+        );
+        let _ = plan(&input(accounts), ix);
+    }
+
+    /// Readers hash the commitment into a Poseidon leaf, so the program must
+    /// refuse one that is not a BN254 field element even though it no longer
+    /// hashes it itself.
+    #[test]
+    #[should_panic]
+    fn plan_register_rejects_a_commitment_outside_the_field() {
+        let commitment = [0xFF; 32];
+        let ix = Instruction::Register {
+            tree_id: TREE_ID,
+            id_commitment: commitment,
+            rate_limit: RATE,
+            now_ms: NOW_MS,
+            price_per_unit: PRICE,
+            active_duration_sec: ACTIVE_SEC,
+            grace_period_duration_sec: GRACE_SEC,
+            leaf_index: LEAF,
+        };
+        let mut accounts = register_accounts();
+        accounts[4] = AccountMeta::new(
+            pda_of(membership_seed(&TREE_ID, &commitment)),
             false,
             self_id(),
         );
@@ -998,7 +962,7 @@ mod tests {
     #[should_panic(expected = "Payer must authorize payment")]
     fn plan_register_rejects_unauthorized_payer() {
         let mut accounts = register_accounts();
-        accounts[2] = payer_meta(false);
+        accounts[1] = payer_meta(false);
         let _ = plan(&input(accounts), register_ix());
     }
 
@@ -1006,7 +970,7 @@ mod tests {
     #[should_panic(expected = "Wrong clock account")]
     fn plan_register_rejects_wrong_clock() {
         let mut accounts = register_accounts();
-        accounts[4] = AccountMeta::new(
+        accounts[3] = AccountMeta::new(
             AccountId::new(*b"/LEZ/ClockProgramAccount/0000001"),
             false,
             clock_core::clock_account_id(),
@@ -1018,7 +982,7 @@ mod tests {
     #[should_panic(expected = "Wrong membership PDA")]
     fn plan_register_rejects_membership_of_other_commitment() {
         let mut accounts = register_accounts();
-        accounts[5] = AccountMeta::new(
+        accounts[4] = AccountMeta::new(
             pda_of(membership_seed(&TREE_ID, &[3; 32])),
             false,
             self_id(),
@@ -1030,12 +994,12 @@ mod tests {
     #[should_panic(expected = "membership must select this program's shard")]
     fn plan_register_rejects_foreign_membership_shard() {
         let mut accounts = register_accounts();
-        accounts[5].program_account_id = AccountId::new(MERKLE);
+        accounts[4].program_account_id = AccountId::new([0xB2; 32]);
         let _ = plan(&input(accounts), register_ix());
     }
 
     #[test]
-    #[should_panic(expected = "exactly 6 accounts")]
+    #[should_panic(expected = "exactly 5 accounts")]
     fn plan_register_rejects_wrong_account_count() {
         let mut accounts = register_accounts();
         accounts.pop();
@@ -1043,17 +1007,10 @@ mod tests {
     }
 
     #[test]
-    fn plan_slash_releases_and_removes() {
+    fn plan_slash_releases_clears_and_emits_slashed() {
         let plan = plan(
-            &input(vec![config_meta(), tree_main_meta(), membership_meta()]),
-            Instruction::Slash {
-                tree_id: TREE_ID,
-                id_commitment: commitment(),
-                identity_secret: secret(),
-                merkle_program_id: MERKLE,
-                leaf_index: 5,
-                rate_limit: RATE,
-            },
+            &input(vec![config_meta(), membership_meta()]),
+            slash_ix(secret()),
         );
         assert_eq!(
             plan.output().effects,
@@ -1062,7 +1019,6 @@ mod tests {
                     &config_meta(),
                     &Effect::ReleaseConfig {
                         tree_id: TREE_ID,
-                        merkle_program_id: MERKLE,
                         rate_limit: RATE
                     }
                 ),
@@ -1075,11 +1031,12 @@ mod tests {
                 ),
             ]
         );
+        assert!(plan.output().chained_calls.is_empty());
         assert_eq!(
-            plan.output().chained_calls,
-            vec![expected_merkle(&MerkleInstruction::Remove {
-                index: 5,
-                leaf: compute_registration_leaf(&commitment(), RATE),
+            events(&plan),
+            vec![RlnEvent::Slashed(Slashed {
+                tree_id: TREE_ID,
+                id_commitment: commitment(),
             })]
         );
     }
@@ -1090,36 +1047,14 @@ mod tests {
         let mut wrong = secret();
         wrong[1] = 1;
         let _ = plan(
-            &input(vec![config_meta(), tree_main_meta(), membership_meta()]),
-            Instruction::Slash {
-                tree_id: TREE_ID,
-                id_commitment: commitment(),
-                identity_secret: wrong,
-                merkle_program_id: MERKLE,
-                leaf_index: 5,
-                rate_limit: RATE,
-            },
+            &input(vec![config_meta(), membership_meta()]),
+            slash_ix(wrong),
         );
     }
 
     #[test]
-    fn plan_extend_charges_the_registration_price() {
-        let plan = plan(
-            &input(vec![
-                config_meta(),
-                membership_meta(),
-                payer_meta(true),
-                treasury_meta(),
-                clock_meta(),
-            ]),
-            Instruction::Extend {
-                tree_id: TREE_ID,
-                id_commitment: commitment(),
-                now_ms: NOW_MS,
-                price_per_unit: PRICE,
-                rate_limit: RATE,
-            },
-        );
+    fn plan_extend_charges_the_registration_price_and_emits_extended() {
+        let plan = plan(&input(extend_accounts(true)), extend_ix(12_345));
         assert_eq!(
             plan.output().effects,
             vec![
@@ -1136,7 +1071,8 @@ mod tests {
                     &membership_meta(),
                     &Effect::ExtendMembership {
                         now_ms: NOW_MS,
-                        rate_limit: RATE
+                        rate_limit: RATE,
+                        expiry_timestamp_ms: 12_345,
                     }
                 ),
             ]
@@ -1145,46 +1081,27 @@ mod tests {
             plan.output().chained_calls,
             vec![expected_payment(u128::from(RATE) * PRICE)]
         );
+        assert_eq!(
+            events(&plan),
+            vec![RlnEvent::Extended(Extended {
+                tree_id: TREE_ID,
+                id_commitment: commitment(),
+                expiry_timestamp_ms: 12_345,
+            })]
+        );
     }
 
     #[test]
     #[should_panic(expected = "Payer must authorize payment")]
     fn plan_extend_rejects_unauthorized_payer() {
-        let _ = plan(
-            &input(vec![
-                config_meta(),
-                membership_meta(),
-                payer_meta(false),
-                treasury_meta(),
-                clock_meta(),
-            ]),
-            Instruction::Extend {
-                tree_id: TREE_ID,
-                id_commitment: commitment(),
-                now_ms: NOW_MS,
-                price_per_unit: PRICE,
-                rate_limit: RATE,
-            },
-        );
+        let _ = plan(&input(extend_accounts(false)), extend_ix(0));
     }
 
     #[test]
-    fn plan_erase_releases_and_removes() {
+    fn plan_erase_releases_clears_and_emits_erased() {
         let plan = plan(
-            &input(vec![
-                config_meta(),
-                tree_main_meta(),
-                membership_meta(),
-                clock_meta(),
-            ]),
-            Instruction::Erase {
-                tree_id: TREE_ID,
-                id_commitment: commitment(),
-                merkle_program_id: MERKLE,
-                leaf_index: 5,
-                rate_limit: RATE,
-                now_ms: NOW_MS,
-            },
+            &input(vec![config_meta(), membership_meta(), clock_meta()]),
+            erase_ix(),
         );
         assert_eq!(
             plan.output().effects,
@@ -1193,7 +1110,6 @@ mod tests {
                     &config_meta(),
                     &Effect::ReleaseConfig {
                         tree_id: TREE_ID,
-                        merkle_program_id: MERKLE,
                         rate_limit: RATE
                     }
                 ),
@@ -1207,11 +1123,12 @@ mod tests {
                 ),
             ]
         );
+        assert!(plan.output().chained_calls.is_empty());
         assert_eq!(
-            plan.output().chained_calls,
-            vec![expected_merkle(&MerkleInstruction::Remove {
-                index: 5,
-                leaf: compute_registration_leaf(&commitment(), RATE),
+            events(&plan),
+            vec![RlnEvent::Erased(Erased {
+                tree_id: TREE_ID,
+                id_commitment: commitment(),
             })]
         );
     }
@@ -1222,20 +1139,8 @@ mod tests {
         let mut clock = clock_meta();
         clock.program_account_id = self_id();
         let _ = plan(
-            &input(vec![
-                config_meta(),
-                tree_main_meta(),
-                membership_meta(),
-                clock,
-            ]),
-            Instruction::Erase {
-                tree_id: TREE_ID,
-                id_commitment: commitment(),
-                merkle_program_id: MERKLE,
-                leaf_index: 5,
-                rate_limit: RATE,
-                now_ms: NOW_MS,
-            },
+            &input(vec![config_meta(), membership_meta(), clock]),
+            erase_ix(),
         );
     }
 
@@ -1257,95 +1162,90 @@ mod tests {
         let _ = apply(Effect::InitConfig(config_state()), &config_bytes());
     }
 
-    #[test]
-    fn apply_init_tree_guard_keeps_config() {
-        let out = apply(
-            Effect::InitTreeGuard {
-                tree_id: TREE_ID,
-                merkle_program_id: MERKLE,
-            },
-            &config_bytes(),
-        );
-        assert!(out.is_none());
-    }
-
-    /// The claimed callee id is checked against config before the merkle
-    /// program ever holds the `main` seed.
-    #[test]
-    #[should_panic(expected = "merkle_program_id claim must match config")]
-    fn apply_init_tree_guard_rejects_caller_named_program() {
-        let _ = apply(
-            Effect::InitTreeGuard {
-                tree_id: TREE_ID,
-                merkle_program_id: [0xEE; 32],
-            },
-            &config_bytes(),
-        );
-    }
-
-    fn register_config(
-        f: impl FnOnce(&mut [u8; 32], &mut u128, &mut [u8; 32], &mut u32, &mut u32),
-    ) -> Effect {
-        let (mut merkle, mut price, mut treasury, mut active, mut grace) =
-            (MERKLE, PRICE, TREASURY, ACTIVE_SEC, GRACE_SEC);
-        f(
-            &mut merkle,
-            &mut price,
-            &mut treasury,
-            &mut active,
-            &mut grace,
-        );
+    fn register_config(f: impl FnOnce(&mut u128, &mut [u8; 32], &mut u32, &mut u32)) -> Effect {
+        let (mut price, mut treasury, mut active, mut grace) =
+            (PRICE, TREASURY, ACTIVE_SEC, GRACE_SEC);
+        f(&mut price, &mut treasury, &mut active, &mut grace);
         Effect::RegisterConfig {
             tree_id: TREE_ID,
-            merkle_program_id: merkle,
             price_per_unit: price,
             treasury,
             rate_limit: RATE,
             active_duration_sec: active,
             grace_period_duration_sec: grace,
+            leaf_index: LEAF,
         }
     }
 
     #[test]
     fn apply_register_config_counts_the_member() {
-        let out = apply(register_config(|_, _, _, _, _| {}), &config_bytes()).unwrap();
+        let out = apply(register_config(|_, _, _, _| {}), &config_bytes()).unwrap();
         let mut expected = config_state();
         expected.total_registrations = 4;
         expected.current_total_rate_limit = 800;
+        expected.next_leaf_index = LEAF + 1;
         assert_eq!(out, encode(&expected));
     }
 
+    /// The `Registered` event carries the claimed index, so the apply must
+    /// refuse one that is not the config's next.
     #[test]
-    #[should_panic(expected = "merkle_program_id claim")]
-    fn apply_register_config_rejects_wrong_merkle_claim() {
-        let _ = apply(
-            register_config(|m, _, _, _, _| *m = [0; 32]),
+    #[should_panic(expected = "leaf_index claim must match config")]
+    fn apply_register_config_rejects_a_taken_leaf_index() {
+        let mut effect = register_config(|_, _, _, _| {});
+        if let Effect::RegisterConfig { leaf_index, .. } = &mut effect {
+            *leaf_index = LEAF - 1;
+        }
+        let _ = apply(effect, &config_bytes());
+    }
+
+    /// A slash or erase uncounts the member but never rewinds the index, so
+    /// a later registration cannot reuse a leaf.
+    #[test]
+    fn apply_release_config_keeps_the_next_leaf_index() {
+        let out = apply(
+            Effect::ReleaseConfig {
+                tree_id: TREE_ID,
+                rate_limit: RATE,
+            },
             &config_bytes(),
-        );
+        )
+        .unwrap();
+        assert_eq!(decode_config(&out).next_leaf_index, LEAF);
+    }
+
+    #[test]
+    #[should_panic(expected = "tree_id arg must match config")]
+    fn apply_register_config_rejects_other_tree() {
+        let mut effect = register_config(|_, _, _, _| {});
+        if let Effect::RegisterConfig { tree_id, .. } = &mut effect {
+            *tree_id = [0; 32];
+        }
+        let _ = apply(effect, &config_bytes());
     }
 
     #[test]
     #[should_panic(expected = "price_per_unit claim")]
     fn apply_register_config_rejects_underpriced_claim() {
-        let _ = apply(register_config(|_, p, _, _, _| *p = 0), &config_bytes());
+        let _ = apply(register_config(|p, _, _, _| *p = 0), &config_bytes());
     }
 
     #[test]
     #[should_panic(expected = "Wrong treasury")]
     fn apply_register_config_rejects_wrong_treasury() {
-        let _ = apply(register_config(|_, _, t, _, _| *t = PAYER), &config_bytes());
+        let _ = apply(register_config(|_, t, _, _| *t = PAYER), &config_bytes());
     }
 
     #[test]
     #[should_panic(expected = "active_duration_sec claim")]
     fn apply_register_config_rejects_wrong_active_duration() {
-        let _ = apply(register_config(|_, _, _, a, _| *a += 1), &config_bytes());
+        let _ = apply(register_config(|_, _, a, _| *a += 1), &config_bytes());
     }
 
     #[test]
     #[should_panic(expected = "grace_period_duration_sec claim")]
     fn apply_register_config_rejects_wrong_grace_duration() {
-        let _ = apply(register_config(|_, _, _, _, g| *g += 1), &config_bytes());
+        let _ = apply(register_config(|_, _, _, g| *g += 1), &config_bytes());
     }
 
     #[test]
@@ -1353,7 +1253,7 @@ mod tests {
     fn apply_register_config_rejects_over_capacity() {
         let mut full = config_state();
         full.current_total_rate_limit = 900;
-        let _ = apply(register_config(|_, _, _, _, _| {}), &encode(&full));
+        let _ = apply(register_config(|_, _, _, _| {}), &encode(&full));
     }
 
     #[test]
@@ -1391,7 +1291,6 @@ mod tests {
         let out = apply(
             Effect::ReleaseConfig {
                 tree_id: TREE_ID,
-                merkle_program_id: MERKLE,
                 rate_limit: RATE,
             },
             &config_bytes(),
@@ -1409,7 +1308,6 @@ mod tests {
         let _ = apply(
             Effect::ReleaseConfig {
                 tree_id: [0; 32],
-                merkle_program_id: MERKLE,
                 rate_limit: RATE,
             },
             &config_bytes(),
@@ -1479,14 +1377,25 @@ mod tests {
         );
     }
 
+    /// The expiry an honest client claims for extending a membership whose
+    /// grace period started at `start`.
+    fn extended_expiry(start: u64) -> u64 {
+        start + secs_to_millis(GRACE_SEC) + secs_to_millis(ACTIVE_SEC) + secs_to_millis(GRACE_SEC)
+    }
+
+    fn extend_membership(expiry_timestamp_ms: u64) -> Effect {
+        Effect::ExtendMembership {
+            now_ms: NOW_MS,
+            rate_limit: RATE,
+            expiry_timestamp_ms,
+        }
+    }
+
     #[test]
     fn apply_extend_membership_advances_one_period() {
         let start = NOW_MS - 10;
         let out = apply(
-            Effect::ExtendMembership {
-                now_ms: NOW_MS,
-                rate_limit: RATE,
-            },
+            extend_membership(extended_expiry(start)),
             &encode(&membership_state(start)),
         )
         .unwrap();
@@ -1495,14 +1404,33 @@ mod tests {
         assert_eq!(out, encode(&expected));
     }
 
+    /// The `Extended` event carries the claimed expiry, so the apply must
+    /// refuse any claim but the one the extension produces.
+    #[test]
+    #[should_panic(expected = "expiry_timestamp_ms claim must match")]
+    fn apply_extend_membership_rejects_an_overstated_expiry() {
+        let start = NOW_MS - 10;
+        let _ = apply(
+            extend_membership(extended_expiry(start) + 1),
+            &encode(&membership_state(start)),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "expiry_timestamp_ms claim must match")]
+    fn apply_extend_membership_rejects_the_pre_extension_expiry() {
+        let start = NOW_MS - 10;
+        let _ = apply(
+            extend_membership(start + secs_to_millis(GRACE_SEC)),
+            &encode(&membership_state(start)),
+        );
+    }
+
     #[test]
     #[should_panic(expected = "CannotExtendNonGracePeriodMembership")]
     fn apply_extend_membership_rejects_active_membership() {
         let _ = apply(
-            Effect::ExtendMembership {
-                now_ms: NOW_MS,
-                rate_limit: RATE,
-            },
+            extend_membership(extended_expiry(NOW_MS + 1)),
             &encode(&membership_state(NOW_MS + 1)),
         );
     }
@@ -1515,6 +1443,7 @@ mod tests {
             Effect::ExtendMembership {
                 now_ms: NOW_MS,
                 rate_limit: RATE - 1,
+                expiry_timestamp_ms: extended_expiry(NOW_MS - 10),
             },
             &encode(&membership_state(NOW_MS - 10)),
         );

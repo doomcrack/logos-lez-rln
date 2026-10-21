@@ -3,12 +3,13 @@
 //! A public transaction runs one zkVM session per plan and one per apply, and
 //! its gas (`fee_core::market::MAX_GAS_EXEC = 10M`, one gas per cycle) is the
 //! SUM over every session of every program in the call chain. This harness
-//! replays the three calls that matter — merkle Initialize (through
-//! `InitializeMerkleTree`), and a full `Register` (whose chained merkle Insert
-//! is the Poseidon-heavy session) — one session at a time, framing each call
-//! with `Program::write_plan_inputs` / `write_apply_inputs` exactly as lee
-//! does, and prints every session's cycles next to the whole-transaction
-//! count lee's own metering reports for the same call.
+//! replays a full `Register` and a `Slash` (whose plan hashes the identity
+//! secret, the one Poseidon the program still computes) one session at a
+//! time, framing each call with `Program::write_plan_inputs` /
+//! `write_apply_inputs` exactly as lee does, and prints every session's cycles
+//! next to the whole-transaction count lee's own metering reports for the same
+//! call. The only chained call left is the native transfer, which lee runs as
+//! Rust, not as a session.
 //!
 //! Run:
 //! ```bash
@@ -33,10 +34,12 @@ mod tests {
     };
     use risc0_zkvm::{ExecutorEnv, ExecutorEnvBuilder, default_executor};
 
-    use crate::state_tests::fixtures::{
-        DEFAULT_ACTIVE_DURATION_SEC, DEFAULT_GRACE_PERIOD_DURATION_SEC,
-        DEFAULT_MAX_TOTAL_RATE_LIMIT, MERKLE_ID, REG_ID, TREE_ID, TestSetup, init_tree_tx,
-        load_merkle, load_registration, register_ix, register_tx, setup, setup_config_only,
+    use crate::{
+        fr_bytes::{bytes_le_to_fr, fr_to_bytes_le},
+        state_tests::fixtures::{
+            REG_ID, TestSetup, load_registration, register, register_ix, register_tx, setup,
+            slash_ix, slash_tx,
+        },
     };
 
     /// risc0's per-session limit; no single plan or apply may cross it.
@@ -45,19 +48,18 @@ mod tests {
     /// What rejects a transaction: the summed cycles of all its sessions.
     const MAX_GAS_EXEC: u64 = 10_000_000;
 
-    /// Early-warning budget for the single heaviest session (the merkle
-    /// insert's apply), below `MAX_GAS_EXEC` so a codegen or dependency change
-    /// that inflates cycles is caught with margin to react.
-    const SESSION_EARLY_WARNING: u64 = 9_000_000;
+    /// Early-warning budget for a whole membership transaction. With no
+    /// tree to update, the heaviest is a slash at about one Poseidon
+    /// compression; this sits well above it and well below `MAX_GAS_EXEC`, so
+    /// a codegen or dependency change that inflates cycles is caught with
+    /// margin to react.
+    const TX_EARLY_WARNING: u64 = 3_000_000;
 
     fn programs() -> HashMap<AccountId, Program> {
-        HashMap::from([
-            (
-                REG_ID,
-                load_registration().expect("registration .bin staged"),
-            ),
-            (MERKLE_ID, load_merkle().expect("merkle .bin staged")),
-        ])
+        HashMap::from([(
+            REG_ID,
+            load_registration().expect("registration .bin staged"),
+        )])
     }
 
     /// One zkVM session, framed by `write`, under the session limit.
@@ -114,11 +116,7 @@ mod tests {
         log: &mut Vec<(String, u64)>,
     ) {
         let program = &programs[&program_id];
-        let name = if program_id == REG_ID {
-            "registration"
-        } else {
-            "merkle"
-        };
+        let name = "registration";
         let input = PlanInput {
             self_account_id: program_id,
             caller_account_id: caller,
@@ -262,57 +260,56 @@ mod tests {
     }
 
     #[test]
-    fn merkle_initialize_cycles_under_budget() {
-        let setup = setup_config_only(
-            DEFAULT_MAX_TOTAL_RATE_LIMIT,
-            DEFAULT_ACTIVE_DURATION_SEC,
-            DEFAULT_GRACE_PERIOD_DURATION_SEC,
-        )
-        .expect("guest .bins staged");
-        let tx = init_tree_tx(&setup.state, &TREE_ID, MERKLE_ID);
-        let log = measure("InitializeMerkleTree", &setup.state, &tx, None);
-        assert!(log.iter().any(|(w, _)| w.starts_with("merkle apply")));
-    }
-
-    #[test]
-    fn register_and_merkle_insert_cycles_under_budget() {
+    fn register_cycles_under_budget() {
         let setup: TestSetup = setup().expect("guest .bins staged");
         let mut id_commitment = [0u8; 32];
         id_commitment[0] = 0x42;
         let tx = register_tx(&setup, register_ix(&setup.state, id_commitment, 100));
-        let log = measure(
-            "Register (incl. merkle Insert)",
-            &setup.state,
-            &tx,
-            Some(setup.payer_id),
-        );
-
-        let (_, insert) = log
-            .iter()
-            .rev()
-            .find(|(w, _)| w.starts_with("merkle apply"))
-            .expect("the register chain ends in a merkle insert");
+        let log = measure("Register", &setup.state, &tx, Some(setup.payer_id));
         assert!(
-            *insert < SESSION_EARLY_WARNING,
-            "merkle Insert apply {insert} cycles exceeds the early-warning budget \
-             {SESSION_EARLY_WARNING}"
+            log.iter().all(|(w, _)| w.starts_with("registration")),
+            "a register runs no other program's sessions: {log:?}"
+        );
+        let whole: u64 = log.iter().map(|(_, c)| c).sum();
+        assert!(
+            whole < TX_EARLY_WARNING,
+            "Register {whole} cycles exceeds the early-warning budget {TX_EARLY_WARNING}"
+        );
+    }
+
+    #[test]
+    fn slash_cycles_under_budget() {
+        let mut setup: TestSetup = setup().expect("guest .bins staged");
+        let mut secret = [0u8; 32];
+        secret[0] = 0x42;
+        let id_commitment = fr_to_bytes_le(
+            &rln::prelude::Hasher::<rln::prelude::PoseidonHash>::hash_single(
+                bytes_le_to_fr(&secret).expect("valid secret"),
+            ),
+        );
+        register(&mut setup, id_commitment, 100);
+        let tx = slash_tx(&setup.state, slash_ix(&setup.state, secret, id_commitment));
+        let log = measure("Slash", &setup.state, &tx, None);
+        let whole: u64 = log.iter().map(|(_, c)| c).sum();
+        assert!(
+            whole < TX_EARLY_WARNING,
+            "Slash {whole} cycles exceeds the early-warning budget {TX_EARLY_WARNING}"
         );
     }
 
     /// The deploy path uploads only the user ELF and re-attaches the
     /// protocol's kernel; the loader refuses a `.bin` whose kernel is anything
-    /// but `V1COMPAT_ELF`. A staged `.bin` must pass that check as-is.
+    /// but `V1COMPAT_ELF`. The staged `.bin` must pass that check as-is.
     #[test]
     fn staged_bins_carry_the_canonical_kernel() {
-        for name in ["rln_registration", "incremental_merkle_tree"] {
-            let path = crate::state_tests::fixtures::guest_binary_dir().join(format!("{name}.bin"));
-            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
-            let segments = crate::rln::client::deploy_segment_count(&bytes)
-                .unwrap_or_else(|e| panic!("{name}.bin is not deployable: {e}"));
-            println!(
-                "{name}.bin: {} B, {segments} deploy segment(s)",
-                bytes.len()
-            );
-        }
+        let name = "rln_registration";
+        let path = crate::state_tests::fixtures::guest_binary_dir().join(format!("{name}.bin"));
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+        let segments = crate::rln::client::deploy_segment_count(&bytes)
+            .unwrap_or_else(|e| panic!("{name}.bin is not deployable: {e}"));
+        println!(
+            "{name}.bin: {} B, {segments} deploy segment(s)",
+            bytes.len()
+        );
     }
 }

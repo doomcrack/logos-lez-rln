@@ -1,4 +1,6 @@
-//! Register one or more RLN memberships and print config account IDs and leaf indices.
+//! Register one or more RLN memberships and print the config account id and
+//! each membership's expiry. Leaf indices are assigned by event readers
+//! (`get_roots`), not by the chain.
 //!
 //! ```bash
 //! source dev/env.sh && cargo run --bin register_member          # single
@@ -7,8 +9,8 @@
 
 use logos_lez_rln::rln::{
     client::{
-        RlnIdentity, create_identity, init_wallet, register_identity, resolve_payer,
-        tree_id_from_env,
+        RlnIdentity, create_identity, init_wallet, membership_expiry_ms, register_identity,
+        resolve_payer, tree_id_from_env,
     },
     derive_config_account, program_ids_or_exit,
 };
@@ -29,12 +31,11 @@ async fn main() {
 
         let RlnIdentity {
             id_commitment_bytes,
-            leaf_bytes,
             id_secret_hash_hex,
             ..
         } = create_identity(&mut wallet_core, USER_MESSAGE_LIMIT).await;
 
-        let leaf_index = register_identity(
+        let registration = register_identity(
             &wallet_core,
             &programs,
             &tree_id,
@@ -45,21 +46,26 @@ async fn main() {
         .await
         .unwrap_or_else(|| {
             panic!(
-                "Timeout waiting for leaf 0x{} to appear on-chain",
-                hex::encode(leaf_bytes)
+                "Timeout waiting for the membership of 0x{} to appear on-chain",
+                hex::encode(id_commitment_bytes)
             )
         });
 
         println!("CONFIG_ACCOUNT={}", config_account_id);
-        println!("LEAF_INDEX={}", leaf_index);
+        println!("ID_COMMITMENT={}", hex::encode(id_commitment_bytes));
+        println!("LEAF_INDEX={}", registration.leaf_index);
+        println!(
+            "EXPIRY_TIMESTAMP_MS={}",
+            membership_expiry_ms(&registration.membership)
+        );
         println!("IDENTITY_SECRET_HASH={}", id_secret_hash_hex);
 
         if count > 1 {
             eprintln!(
-                "  Registered member {}/{}: leaf={}",
+                "  Registered member {}/{}: commitment=0x{}",
                 i + 1,
                 count,
-                leaf_index
+                hex::encode(&id_commitment_bytes[..8])
             );
         }
     }

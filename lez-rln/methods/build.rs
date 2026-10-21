@@ -44,7 +44,7 @@ fn main() {
     ];
 
     for bin_dir in &bin_dirs {
-        for name in ["rln_registration.bin", "incremental_merkle_tree.bin"] {
+        for name in ["rln_registration.bin"] {
             let path = bin_dir.join(name);
             if path.exists() {
                 strip_program_binary(&path, &strip);

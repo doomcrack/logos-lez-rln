@@ -6,9 +6,29 @@
 #   bash tools/e2e-local.sh [-- <extra cargo test args>]
 #
 # Everything throwaway lives under dev/e2e/ (wallet, sequencer log). The guest
-# `.bin`s must already be built and staged in
+# `.bin` must already be built and staged in
 # lez-rln/methods/guest/target/riscv32im-risc0-zkvm-elf/docker/.
+#
+# The membership tree is not on chain: the test rebuilds it from the
+# registration program's events, which only the LEZ indexer serves
+# (`getEvents`; the sequencer RPC has none). At v0.3.1 the indexer follows
+# blocks through a Bedrock channel, and the standalone sequencer `dev.sh`
+# boots publishes to none, so set LEZ_RLN_INDEXER_URL to an indexer that
+# follows THIS sequencer (LEZ's lez/configs/docker-all-in-one stack, with
+# `"event_filter": "archival"`). Without it the script refuses to start.
 set -euo pipefail
+
+if [ -z "${LEZ_RLN_INDEXER_URL:-}" ]; then
+  cat >&2 <<'MSG'
+error: LEZ_RLN_INDEXER_URL is not set.
+The lifecycle test reads the membership tree from the program's events, which
+only a LEZ indexer serves, and the v0.3.1 indexer follows blocks through a
+Bedrock channel that dev.sh's standalone sequencer does not publish to. Point
+LEZ_RLN_INDEXER_URL at an indexer following this sequencer (e.g. LEZ's
+docker-all-in-one stack, event_filter "archival").
+MSG
+  exit 2
+fi
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 E2E="$REPO/dev/e2e"
