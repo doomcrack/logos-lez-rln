@@ -81,6 +81,10 @@ path = "src/bin/register_member.rs"
 name = "account_balance"
 path = "src/bin/account_balance.rs"
 
+[[bin]]
+name = "slash_member"
+path = "src/bin/slash_member.rs"
+
 [dev-dependencies]
 nssa = { package = "lee", git = "https://github.com/logos-blockchain/logos-execution-zone.git", tag = "v0.3.1", features = ["test-utils"] }
 # Cycle harness (src/cycle_harness.rs) drives the guest through the same
