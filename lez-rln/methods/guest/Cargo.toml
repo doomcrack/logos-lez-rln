@@ -62,10 +62,6 @@ rust-poseidon-bn254-pure = { git = "https://github.com/logos-storage/rust-poseid
 sha2 = { git = "https://github.com/risc0/RustCrypto-hashes", tag = "sha2-v0.10.8-risczero.0" }
 
 [[bin]]
-name = "incremental_merkle_tree"
-path = "src/bin/incremental_merkle_tree.rs"
-
-[[bin]]
 name = "rln_registration"
 path = "src/bin/rln_registration.rs"
 

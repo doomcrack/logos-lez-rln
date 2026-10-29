@@ -1,9 +1,9 @@
 //! SPEL-style PDA seed primitives shared across modules.
 //!
-//! Leaf module with no internal dependencies. Both `rln::pda` and
-//! `merkle_tree::pda` build their derivations on these helpers. The seed
-//! primitives live in `rln-layouts` so the guest shares them; this module
-//! re-exports them and adds the host-only `derive_pda`.
+//! Leaf module with no internal dependencies. `rln::pda` builds its
+//! derivations on these helpers. The seed primitives live in `rln-layouts` so
+//! the guest shares them; this module re-exports them and adds the host-only
+//! `derive_pda`.
 
 use nssa::AccountId;
 use nssa_core::program::PdaSeed;

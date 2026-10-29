@@ -77,7 +77,7 @@ async fn main() {
 
         let leaf_bytes = compute_rate_commitment(id_commitment, *rate_limit);
 
-        let leaf_index = register_identity(
+        let registration = register_identity(
             &wallet_core,
             &programs,
             &tree_id,
@@ -86,19 +86,19 @@ async fn main() {
             *rate_limit,
         )
         .await;
-        let Some(leaf_index) = leaf_index else {
+        let Some(registration) = registration else {
             eprintln!(
-                "WARNING: leaf 0x{} not confirmed, continuing...",
+                "WARNING: membership of rate commitment 0x{} not confirmed, continuing...",
                 hex::encode(&leaf_bytes[..8])
             );
             continue;
         };
 
         eprintln!(
-            "  Registered {}/{}: leaf_index={} commitment=0x{}... rate_commitment=0x{}...",
+            "  Registered {}/{}: leaf={} commitment=0x{}... rate_commitment=0x{}...",
             i + 1,
             entries.len(),
-            leaf_index,
+            registration.leaf_index,
             hex::encode(&id_commitment[..8]),
             hex::encode(&leaf_bytes[..8])
         );

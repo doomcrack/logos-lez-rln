@@ -3141,6 +3141,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ee796ad498c8d9a1d68e477df8f754ed784ef875de1414ebdaf169f70a6a784"
 
 [[package]]
+name = "indexer_service_protocol"
+version = "0.1.0"
+source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.3.1#1a003bfbfb89fcf987f62975cd08a401169e1b8c"
+dependencies = [
+ "anyhow",
+ "base58",
+ "base64 0.22.1",
+ "hex",
+ "schemars 1.2.1",
+ "serde",
+ "serde_with",
+]
+
+[[package]]
+name = "indexer_service_rpc"
+version = "0.1.0"
+source = "git+https://github.com/logos-blockchain/logos-execution-zone.git?tag=v0.3.1#1a003bfbfb89fcf987f62975cd08a401169e1b8c"
+dependencies = [
+ "indexer_service_protocol",
+ "jsonrpsee",
+ "schemars 1.2.1",
+ "serde_json",
+]
+
+[[package]]
 name = "indexmap"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4992,6 +5017,9 @@ dependencies = [
  "clock_core",
  "common",
  "hex",
+ "indexer_service_protocol",
+ "indexer_service_rpc",
+ "jsonrpsee",
  "lee",
  "lee_core",
  "program_loader_core",
@@ -6846,7 +6874,7 @@ dependencies = [
 
 [[package]]
 name = "rln-layouts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "borsh",
  "bytemuck",
@@ -7221,8 +7249,21 @@ checksum = "a2b42f36aa1cd011945615b92222f6bf73c599a102a300334cd7f8dbeec726cc"
 dependencies = [
  "dyn-clone",
  "ref-cast",
+ "schemars_derive",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "schemars_derive"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d115b50f4aaeea07e79c1912f645c7513d81715d0420f8bc77a18c6260b307f"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "serde_derive_internals",
+ "syn 2.0.118",
 ]
 
 [[package]]
@@ -7378,6 +7419,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "serde_derive_internals"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18d26a20a969b9e3fdf2fc2d9f21eda6c40e2de84c9408bb5d3b05d499aae711"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.118",
 ]
 
 [[package]]

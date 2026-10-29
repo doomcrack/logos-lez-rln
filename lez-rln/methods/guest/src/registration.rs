@@ -4,13 +4,10 @@ use nssa_core::program::AccountMeta;
 use rln_layouts::exit::{EXIT_CLOCK_NOT_INITIALIZED, EXIT_STALE_CLOCK};
 
 // Re-export rate limit and expiration constants / helpers from shared crate
+use crate::ensure;
 pub use crate::layouts::{
     CLOCK_50_ACCOUNT_ID_BYTES, CLOCK_CLAIM_TOLERANCE_MS, MAX_RATE_LIMIT, MIN_RATE_LIMIT,
     is_expired, is_in_grace_period,
-};
-use crate::{
-    ensure,
-    hash::{hash_pair, validate_field_element},
 };
 
 // ============================================================================
@@ -43,20 +40,6 @@ pub fn validate_rate_limit(rate_limit: u64) {
 /// one is unaffordable and the native transfer refuses it.
 pub fn calculate_payment_amount(rate_limit: u64, price_per_unit: u128) -> u128 {
     price_per_unit.saturating_mul(rate_limit as u128)
-}
-
-// ============================================================================
-// Leaf Computation
-// ============================================================================
-
-/// Compute the leaf value for merkle tree insertion.
-///
-/// The leaf is H(id_commitment, rate_limit).
-pub fn compute_registration_leaf(id_commitment: &[u8; 32], rate_limit: u64) -> [u8; 32] {
-    validate_field_element(id_commitment);
-    let mut rate_bytes = [0u8; 32];
-    rate_bytes[..8].copy_from_slice(&rate_limit.to_le_bytes());
-    hash_pair(id_commitment, &rate_bytes)
 }
 
 // ============================================================================
@@ -142,22 +125,6 @@ mod tests {
     #[test]
     fn calculate_payment_amount_saturates_instead_of_wrapping() {
         assert_eq!(calculate_payment_amount(2, u128::MAX), u128::MAX);
-    }
-
-    #[test]
-    fn test_compute_registration_leaf() {
-        let id_commitment = [1u8; 32];
-        let rate_limit = 100u64;
-
-        let leaf = compute_registration_leaf(&id_commitment, rate_limit);
-
-        // Should be deterministic
-        let leaf2 = compute_registration_leaf(&id_commitment, rate_limit);
-        assert_eq!(leaf, leaf2);
-
-        // Different inputs should produce different leaves
-        let leaf3 = compute_registration_leaf(&id_commitment, 200);
-        assert_ne!(leaf, leaf3);
     }
 
     #[test]

@@ -5,12 +5,13 @@
 //! halts with a non-zero exit code is charged the cycles it actually ran
 //! (`LeeError::ProgramExitedWithCode { code, cycles }`). A client that built
 //! an honest transaction from a slightly stale view — the clock ticked, a
-//! concurrent registration took the last unit of capacity, someone slashed
-//! the member first — therefore pays for the work done, not for the ceiling.
+//! concurrent registration took the next leaf index or the last unit of
+//! capacity, someone slashed the member first — therefore pays for the work
+//! done, not for the ceiling.
 //!
 //! Checks that only a malformed or hostile transaction can fail — wrong PDA,
-//! wrong account count or shard, a non-field element, a tree or config id that
-//! is not the stored one, an init replay — still panic: nothing about the
+//! wrong account count or shard, a non-field element, a tree id that is not
+//! the stored one, an init replay — still panic: nothing about the
 //! chain can make an honest client trip them, and the full charge is the
 //! deterrent.
 //!
@@ -35,11 +36,15 @@ pub const EXIT_STALE_RATE_LIMIT: u8 = 16;
 pub const EXIT_NOT_IN_GRACE_PERIOD: u8 = 17;
 /// Erase of a membership that has not expired.
 pub const EXIT_NOT_EXPIRED: u8 = 18;
-/// The leaf at the hinted index is not the member's (or the index is past
-/// `next_index`).
-pub const EXIT_LEAF_MISMATCH: u8 = 19;
-/// Every leaf index has been used.
-pub const EXIT_TREE_FULL: u8 = 20;
+// 19 (LeafMismatch) and 20 (TreeFull) belonged to the on-chain merkle tree,
+// which this program no longer has. Left unused rather than renumbered so a
+// code in an old log keeps its meaning.
+/// The claimed post-extension expiry is not the one the membership apply
+/// computes (the membership was extended meanwhile).
+pub const EXIT_STALE_EXPIRY: u8 = 21;
+/// The claimed `leaf_index` is not the config's `next_leaf_index`: another
+/// registration took it first.
+pub const EXIT_STALE_LEAF_INDEX: u8 = 22;
 
 /// The name of an exit code, for logs and error messages.
 pub fn exit_code_name(code: u32) -> Option<&'static str> {
@@ -54,8 +59,8 @@ pub fn exit_code_name(code: u32) -> Option<&'static str> {
         EXIT_STALE_RATE_LIMIT => "StaleRateLimit",
         EXIT_NOT_IN_GRACE_PERIOD => "NotInGracePeriod",
         EXIT_NOT_EXPIRED => "NotExpired",
-        EXIT_LEAF_MISMATCH => "LeafMismatch",
-        EXIT_TREE_FULL => "TreeFull",
+        EXIT_STALE_EXPIRY => "StaleExpiry",
+        EXIT_STALE_LEAF_INDEX => "StaleLeafIndex",
         _ => return None,
     })
 }
@@ -76,8 +81,8 @@ mod tests {
             EXIT_STALE_RATE_LIMIT,
             EXIT_NOT_IN_GRACE_PERIOD,
             EXIT_NOT_EXPIRED,
-            EXIT_LEAF_MISMATCH,
-            EXIT_TREE_FULL,
+            EXIT_STALE_EXPIRY,
+            EXIT_STALE_LEAF_INDEX,
         ];
         for (i, a) in codes.iter().enumerate() {
             let name = exit_code_name(u32::from(*a)).expect("every code is named");

@@ -1,32 +1,39 @@
 //! The registry's whole lifecycle against a LIVE sequencer: deploy, init,
-//! register, prove, a refused duplicate, slash, extend, erase.
+//! register, prove, a refused duplicate, slash, extend, erase — with the
+//! membership tree rebuilt from the program's events, as a Zone reader would.
 //!
 //! Skipped unless `LEZ_RLN_LOCAL_SEQUENCER` is set. `tools/e2e-local.sh`
-//! boots a sequencer with `dev.sh`, funds a payer at genesis and runs this
-//! with the environment it needs:
+//! boots a sequencer and an indexer with `dev.sh`, funds a payer at genesis
+//! and runs this with the environment it needs:
 //!
 //! - `LEE_WALLET_HOME_DIR`: a wallet whose config names the local sequencer;
 //! - `LEZ_RLN_PAYER`: the genesis-funded account (deploys, pays, signs);
+//! - `LEZ_RLN_INDEXER_URL`: the local indexer, which serves the events;
 //! - `LEZ_RLN_ACTIVE_DURATION_SECS` / `LEZ_RLN_GRACE_PERIOD_DURATION_SECS`: seconds, so extend and
 //!   erase become legal within a few clock ticks.
 //!
 //! `CLOCK_50` moves every 50 blocks, so the two time-gated steps each wait
-//! for the clock to pass a threshold rather than sleeping a fixed time.
+//! for the clock to pass a threshold rather than sleeping a fixed time. The
+//! indexer trails the sequencer, so every reader check polls until the
+//! events it needs have been indexed.
 
 use std::time::Duration;
 
 use logos_lez_rln::{
     fr_bytes::fr_to_bytes_le,
-    merkle_tree::{
-        fetch_tree_shard, find_leaf_index, get_merkle_proof, node_hash, proof_to_circuit,
-    },
+    proof_circuit::CIRCUIT_DEPTH,
     rln::{
         ProgramIds,
         client::{
             RlnIdentity, create_identity, erase_membership, extend_membership, init_wallet,
-            load_programs, membership_durations, read_clock_ms, read_config, read_membership,
-            register_identity, resolve_payer, run_setup, slash_membership,
+            load_program, membership_durations, membership_expiry_ms, read_clock_ms, read_config,
+            read_membership, register_identity, resolve_payer, run_setup, slash_membership,
         },
+    },
+    zone::{
+        MembershipSet, RlnEvent,
+        indexer::{fetch_all_events, indexer_url_from_env, membership_set},
+        proof_to_circuit,
     },
 };
 use nssa::AccountId;
@@ -69,14 +76,36 @@ async fn wait_for_membership_gone(
     panic!("{what}: membership was never cleared");
 }
 
+/// Poll the indexer until it holds `count` of the registry's events, and
+/// return them.
+async fn wait_for_events(
+    url: &str,
+    program: &AccountId,
+    tree_id: &[u8; 32],
+    count: usize,
+    what: &str,
+) -> Vec<RlnEvent> {
+    for _ in 0..240 {
+        let events = fetch_all_events(url, program, tree_id)
+            .await
+            .unwrap_or_else(|e| panic!("{what}: {e}"));
+        if events.len() >= count {
+            assert_eq!(events.len(), count, "{what}: more events than actions");
+            return events.into_iter().map(|at| at.event).collect();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("{what}: the indexer never held {count} events");
+}
+
 async fn register(
     wallet: &mut WalletCore,
     programs: &ProgramIds,
     tree_id: &[u8; 32],
     payer: &AccountId,
-) -> (RlnIdentity, u64) {
+) -> RlnIdentity {
     let identity = create_identity(wallet, RATE_LIMIT).await;
-    let leaf_index = register_identity(
+    register_identity(
         wallet,
         programs,
         tree_id,
@@ -85,8 +114,8 @@ async fn register(
         RATE_LIMIT,
     )
     .await
-    .expect("the leaf never appeared on-chain");
-    (identity, leaf_index)
+    .expect("the membership never appeared on-chain");
+    identity
 }
 
 async fn native_balance(wallet: &WalletCore, id: &AccountId) -> u128 {
@@ -99,6 +128,7 @@ async fn registry_lifecycle_on_a_live_sequencer() {
         eprintln!("LEZ_RLN_LOCAL_SEQUENCER not set; skipping (run tools/e2e-local.sh)");
         return;
     }
+    let indexer = indexer_url_from_env().expect("LEZ_RLN_INDEXER_URL names the local indexer");
     let (active_sec, grace_sec) = membership_durations();
     assert!(
         active_sec <= 60 && grace_sec <= 300,
@@ -109,20 +139,16 @@ async fn registry_lifecycle_on_a_live_sequencer() {
     let mut tree_id = [0u8; 32];
     tree_id.copy_from_slice(&rand_bytes());
     let mut wallet = init_wallet().await;
-    let (registration_program, merkle_program) = load_programs();
+    let registration_program = load_program();
     let payer = resolve_payer();
 
     // ── deploy + init ─────────────────────────────────────────────────
-    let programs = run_setup(
-        &mut wallet,
-        &registration_program,
-        &merkle_program,
-        &tree_id,
-    )
-    .await;
+    // A fresh tree id, so this run's registry starts empty even when the
+    // program is reused: every event names its tree id, and the reader keeps
+    // only this one's.
+    let programs = run_setup(&mut wallet, &registration_program, &tree_id).await;
     let config = read_config(&wallet, &programs, &tree_id).await;
     assert_eq!(config.tree_id, tree_id);
-    assert_eq!(config.merkle_program_id, *programs.merkle.value());
     assert_eq!(config.active_duration_for_new_memberships_sec, active_sec);
     assert_eq!(config.total_registrations, 0);
     let treasury = AccountId::new(config.treasury_account_id);
@@ -130,10 +156,9 @@ async fn registry_lifecycle_on_a_live_sequencer() {
 
     // ── register three members ────────────────────────────────────────
     let treasury_before = native_balance(&wallet, &treasury).await;
-    let (member_a, leaf_a) = register(&mut wallet, &programs, &tree_id, &payer).await;
-    let (member_b, leaf_b) = register(&mut wallet, &programs, &tree_id, &payer).await;
-    let (member_c, leaf_c) = register(&mut wallet, &programs, &tree_id, &payer).await;
-    assert_eq!((leaf_a, leaf_b, leaf_c), (0, 1, 2));
+    let member_a = register(&mut wallet, &programs, &tree_id, &payer).await;
+    let member_b = register(&mut wallet, &programs, &tree_id, &payer).await;
+    let member_c = register(&mut wallet, &programs, &tree_id, &payer).await;
     let config = read_config(&wallet, &programs, &tree_id).await;
     assert_eq!(config.total_registrations, 3);
     assert_eq!(config.current_total_rate_limit, 3 * RATE_LIMIT);
@@ -146,16 +171,36 @@ async fn registry_lifecycle_on_a_live_sequencer() {
         .await
         .expect("member A is registered");
     assert_eq!(membership_a.rate_limit, RATE_LIMIT);
+
+    let events = wait_for_events(
+        &indexer,
+        &programs.registration,
+        &tree_id,
+        3,
+        "three registrations",
+    )
+    .await;
+    let set = MembershipSet::from_events(CIRCUIT_DEPTH, &events).expect("events apply");
+    let (leaf_a, leaf_b, leaf_c) = (
+        set.leaf_index_of(&member_a.id_commitment_bytes).unwrap(),
+        set.leaf_index_of(&member_b.id_commitment_bytes).unwrap(),
+        set.leaf_index_of(&member_c.id_commitment_bytes).unwrap(),
+    );
     assert_eq!(
-        find_leaf_index(
-            &fetch_tree_shard(&wallet, &programs, &tree_id).await,
-            &member_a.leaf_bytes
-        ),
-        Some(leaf_a)
+        (leaf_b, leaf_c),
+        (leaf_a + 1, leaf_a + 2),
+        "the chain numbers registrations in block order"
+    );
+    assert_eq!(
+        set.member(&member_a.id_commitment_bytes)
+            .unwrap()
+            .expiry_timestamp_ms,
+        membership_expiry_ms(&membership_a),
+        "Registered carries the expiry the chain stored"
     );
 
-    // ── an RLN proof against the on-chain root verifies ───────────────
-    let proof = get_merkle_proof(&wallet, &programs, &tree_id, leaf_a).await;
+    // ── an RLN proof against the reader's root verifies ───────────────
+    let proof = set.proof(leaf_a);
     assert_eq!(proof.leaf, member_a.leaf_bytes);
     let (merkle_proof, root) = proof_to_circuit(&proof);
     let epoch = hash_to_field_le(b"local-sequencer-epoch");
@@ -177,12 +222,11 @@ async fn registry_lifecycle_on_a_live_sequencer() {
         engine
             .verify_with_roots(&rln_proof, &values, &x, &[root])
             .expect("verification runs"),
-        "proof must verify against the folded on-chain root"
+        "proof must verify against the reader's root"
     );
 
     // ── a duplicate registration is refused ───────────────────────────
-    let next_index = leaf_c + 1;
-    assert_eq!(
+    assert!(
         register_identity(
             &wallet,
             &programs,
@@ -191,9 +235,9 @@ async fn registry_lifecycle_on_a_live_sequencer() {
             &payer,
             RATE_LIMIT,
         )
-        .await,
-        None,
-        "re-registering an existing commitment must not insert a leaf"
+        .await
+        .is_none(),
+        "re-registering an existing commitment must not create a membership"
     );
     let config = read_config(&wallet, &programs, &tree_id).await;
     assert_eq!(config.total_registrations, 3);
@@ -202,13 +246,6 @@ async fn registry_lifecycle_on_a_live_sequencer() {
             .await
             .is_some(),
         "still registered"
-    );
-    assert_eq!(
-        find_leaf_index(
-            &fetch_tree_shard(&wallet, &programs, &tree_id).await,
-            &member_a.leaf_bytes
-        ),
-        Some(leaf_a)
     );
 
     // ── slash C by revealing its secret; C may then register again ────
@@ -233,13 +270,7 @@ async fn registry_lifecycle_on_a_live_sequencer() {
     let config = read_config(&wallet, &programs, &tree_id).await;
     assert_eq!(config.total_registrations, 2);
     assert_eq!(config.current_total_rate_limit, 2 * RATE_LIMIT);
-    let shard = fetch_tree_shard(&wallet, &programs, &tree_id).await;
-    assert_eq!(
-        node_hash(&shard, rln_layouts::TREE_DEPTH, leaf_c),
-        ZERO_LEAF,
-        "a slashed leaf is zeroed"
-    );
-    let leaf_c_again = register_identity(
+    register_identity(
         &wallet,
         &programs,
         &tree_id,
@@ -248,9 +279,26 @@ async fn registry_lifecycle_on_a_live_sequencer() {
         RATE_LIMIT,
     )
     .await
-    .expect("C's second leaf never appeared on-chain");
+    .expect("C's second membership never appeared on-chain");
+
+    // The refused duplicate emitted nothing: Registered ×3, Slashed, Registered.
+    let events = wait_for_events(
+        &indexer,
+        &programs.registration,
+        &tree_id,
+        5,
+        "slash and re-register",
+    )
+    .await;
+    let set = MembershipSet::from_events(CIRCUIT_DEPTH, &events).expect("events apply");
     assert_eq!(
-        leaf_c_again, next_index,
+        set.proof(leaf_c).leaf,
+        ZERO_LEAF,
+        "a slashed leaf is zeroed"
+    );
+    assert_eq!(
+        set.leaf_index_of(&member_c.id_commitment_bytes),
+        Some(leaf_c + 1),
         "a slashed commitment registers at a new leaf"
     );
 
@@ -277,12 +325,11 @@ async fn registry_lifecycle_on_a_live_sequencer() {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+    let renewed_a = read_membership(&wallet, &programs, &tree_id, &member_a.id_commitment_bytes)
+        .await
+        .expect("A stays registered");
     assert_eq!(
-        read_membership(&wallet, &programs, &tree_id, &member_a.id_commitment_bytes)
-            .await
-            .expect("A stays registered")
-            .grace_period_start_timestamp_ms,
-        renewed_start,
+        renewed_a.grace_period_start_timestamp_ms, renewed_start,
         "extend pushes the grace window out by one grace + one active period"
     );
     assert_eq!(
@@ -290,12 +337,21 @@ async fn registry_lifecycle_on_a_live_sequencer() {
         treasury_before + price,
         "renewal is priced like a registration"
     );
+    let events = wait_for_events(&indexer, &programs.registration, &tree_id, 6, "extend").await;
+    let set = MembershipSet::from_events(CIRCUIT_DEPTH, &events).expect("events apply");
+    assert_eq!(
+        set.member(&member_a.id_commitment_bytes)
+            .unwrap()
+            .expiry_timestamp_ms,
+        membership_expiry_ms(&renewed_a),
+        "Extended carries the expiry the chain stored"
+    );
 
     // ── erase B once it has expired ───────────────────────────────────
     let membership_b = read_membership(&wallet, &programs, &tree_id, &member_b.id_commitment_bytes)
         .await
         .expect("B is registered");
-    let expiry_b = membership_b.grace_period_start_timestamp_ms + secs_to_millis(grace_sec);
+    let expiry_b = membership_expiry_ms(&membership_b);
     wait_for_clock(&wallet, expiry_b, "erase").await;
     erase_membership(
         &wallet,
@@ -316,13 +372,18 @@ async fn registry_lifecycle_on_a_live_sequencer() {
     let config = read_config(&wallet, &programs, &tree_id).await;
     assert_eq!(config.total_registrations, 2);
     assert_eq!(config.current_total_rate_limit, 2 * RATE_LIMIT);
-    let shard = fetch_tree_shard(&wallet, &programs, &tree_id).await;
+
+    wait_for_events(&indexer, &programs.registration, &tree_id, 7, "erase").await;
+    let set = membership_set(&indexer, &programs.registration, &tree_id, Some(expiry_b))
+        .await
+        .expect("events apply");
     assert_eq!(
-        node_hash(&shard, rln_layouts::TREE_DEPTH, leaf_b),
-        ZERO_LEAF
+        set.proof(leaf_b).leaf,
+        ZERO_LEAF,
+        "an erased leaf is zeroed"
     );
     assert_eq!(
-        node_hash(&shard, rln_layouts::TREE_DEPTH, leaf_a),
+        set.proof(leaf_a).leaf,
         member_a.leaf_bytes,
         "erasing B leaves A's leaf alone"
     );

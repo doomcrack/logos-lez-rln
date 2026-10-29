@@ -10,7 +10,7 @@ use borsh::{BorshDeserialize, BorshSerialize};
 
 /// Borsh layout for the registration program's config account.
 ///
-/// Fixed size: 144 bytes. Field declaration order matches the byte layout
+/// Fixed size: 120 bytes. Field declaration order matches the byte layout
 /// (Borsh encodes fixed-width primitives + fixed arrays in declaration order
 /// with no length prefixes).
 ///
@@ -24,7 +24,6 @@ use borsh::{BorshDeserialize, BorshSerialize};
 /// account's exact size before trusting any offset.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
 pub struct ConfigState {
-    pub merkle_program_id: [u8; 32],
     pub tree_id: [u8; 32],
     /// Native atomic units charged per unit of rate limit.
     pub price_per_unit: u128,
@@ -35,6 +34,10 @@ pub struct ConfigState {
     pub current_total_rate_limit: u64,
     pub active_duration_for_new_memberships_sec: u32,
     pub grace_period_duration_for_new_memberships_sec: u32,
+    /// The leaf index the next registration takes. Counts every registration
+    /// ever made and never goes down (unlike `total_registrations`, which a
+    /// slash or erase decrements), so an index is never reused.
+    pub next_leaf_index: u64,
 }
 
 impl ConfigState {
@@ -46,9 +49,9 @@ impl ConfigState {
 
 /// Borsh layout for a per-member account in the registration program.
 ///
-/// Fixed size: 56 bytes. It records no leaf index: the tree assigns the index
-/// at insert time, and a reader finds a member's leaf by scanning the tree
-/// for `H(id_commitment, rate_limit)`.
+/// Fixed size: 56 bytes. It records no leaf index: the config assigns one at
+/// registration (`ConfigState::next_leaf_index`) and the `Registered` event
+/// carries it.
 #[derive(BorshSerialize, BorshDeserialize, Clone, Debug)]
 pub struct MembershipState {
     pub rate_limit: u64,
@@ -65,7 +68,7 @@ pub struct MembershipState {
 /// is exactly this long before trusting a byte offset into it. `ConfigState`
 /// carries no version discriminator, so the length is the only thing that
 /// distinguishes this layout from an older one.
-pub const CONFIG_STATE_SIZE: usize = 144;
+pub const CONFIG_STATE_SIZE: usize = 120;
 
 /// Serialized size of [`MembershipState`], in bytes.
 pub const MEMBERSHIP_STATE_SIZE: usize = 56;
@@ -81,7 +84,6 @@ mod tests {
     #[test]
     fn config_state_is_the_size_its_readers_assume() {
         let config = ConfigState {
-            merkle_program_id: [1; 32],
             tree_id: [2; 32],
             price_per_unit: 3,
             treasury_account_id: [4; 32],
@@ -90,6 +92,7 @@ mod tests {
             current_total_rate_limit: 7,
             active_duration_for_new_memberships_sec: 8,
             grace_period_duration_for_new_memberships_sec: 9,
+            next_leaf_index: 10,
         };
         let bytes = borsh::to_vec(&config).expect("ConfigState serializes");
         assert_eq!(bytes.len(), CONFIG_STATE_SIZE);
@@ -100,7 +103,6 @@ mod tests {
     #[test]
     fn config_state_fields_sit_where_the_offset_readers_look() {
         let config = ConfigState {
-            merkle_program_id: [0xAA; 32],
             tree_id: [0xBB; 32],
             price_per_unit: 0x1122_3344_5566_7788,
             treasury_account_id: [0xCC; 32],
@@ -109,40 +111,45 @@ mod tests {
             current_total_rate_limit: 0x090A_0B0C,
             active_duration_for_new_memberships_sec: 0x0D0E,
             grace_period_duration_for_new_memberships_sec: 0x0F10,
+            next_leaf_index: 0x1112_1314,
         };
         let b = borsh::to_vec(&config).expect("ConfigState serializes");
-        assert_eq!(&b[0..32], &[0xAA; 32], "merkle_program_id @0");
-        assert_eq!(&b[32..64], &[0xBB; 32], "tree_id @32");
+        assert_eq!(&b[0..32], &[0xBB; 32], "tree_id @0");
         assert_eq!(
-            u128::from_le_bytes(b[64..80].try_into().unwrap()),
+            u128::from_le_bytes(b[32..48].try_into().unwrap()),
             0x1122_3344_5566_7788,
-            "price_per_unit @64",
+            "price_per_unit @32",
         );
-        assert_eq!(&b[80..112], &[0xCC; 32], "treasury_account_id @80");
+        assert_eq!(&b[48..80], &[0xCC; 32], "treasury_account_id @48");
+        assert_eq!(
+            u64::from_le_bytes(b[80..88].try_into().unwrap()),
+            0x0102_0304,
+            "total_registrations @80",
+        );
+        assert_eq!(
+            u64::from_le_bytes(b[88..96].try_into().unwrap()),
+            0x0506_0708,
+            "max_total_rate_limit @88",
+        );
+        assert_eq!(
+            u64::from_le_bytes(b[96..104].try_into().unwrap()),
+            0x090A_0B0C,
+            "current_total_rate_limit @96",
+        );
+        assert_eq!(
+            u32::from_le_bytes(b[104..108].try_into().unwrap()),
+            0x0D0E,
+            "active_duration_sec @104",
+        );
+        assert_eq!(
+            u32::from_le_bytes(b[108..112].try_into().unwrap()),
+            0x0F10,
+            "grace_period_duration_sec @108",
+        );
         assert_eq!(
             u64::from_le_bytes(b[112..120].try_into().unwrap()),
-            0x0102_0304,
-            "total_registrations @112",
-        );
-        assert_eq!(
-            u64::from_le_bytes(b[120..128].try_into().unwrap()),
-            0x0506_0708,
-            "max_total_rate_limit @120",
-        );
-        assert_eq!(
-            u64::from_le_bytes(b[128..136].try_into().unwrap()),
-            0x090A_0B0C,
-            "current_total_rate_limit @128",
-        );
-        assert_eq!(
-            u32::from_le_bytes(b[136..140].try_into().unwrap()),
-            0x0D0E,
-            "active_duration_sec @136",
-        );
-        assert_eq!(
-            u32::from_le_bytes(b[140..144].try_into().unwrap()),
-            0x0F10,
-            "grace_period_duration_sec @140",
+            0x1112_1314,
+            "next_leaf_index @112",
         );
     }
 

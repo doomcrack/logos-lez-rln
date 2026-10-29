@@ -9,8 +9,6 @@
 
 pub use rln_layouts::{MAX_RATE_LIMIT, MIN_RATE_LIMIT};
 
-pub use crate::merkle_tree::{TREE_DEPTH, TREE_LEAVES};
-
 // Layout source of truth: `rln_layouts::ConfigState`.
 //
 // There is no version discriminator in the account, so a reader that has not
@@ -18,15 +16,15 @@ pub use crate::merkle_tree::{TREE_DEPTH, TREE_LEAVES};
 // erroring — a plausible wrong treasury, a plausible wrong price. CONFIG_SIZE
 // is the only thing that tells one layout from another: assert it before
 // trusting any offset below.
-pub const CONFIG_OFFSET_MERKLE_PROGRAM_ID: usize = 0;
-pub const CONFIG_OFFSET_TREE_ID: usize = 32;
-pub const CONFIG_OFFSET_PRICE_PER_UNIT: usize = 64;
-pub const CONFIG_OFFSET_TREASURY_ACCOUNT_ID: usize = 80;
-pub const CONFIG_OFFSET_TOTAL_REGISTRATIONS: usize = 112;
-pub const CONFIG_OFFSET_MAX_TOTAL_RATE_LIMIT: usize = 120;
-pub const CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT: usize = 128;
-pub const CONFIG_OFFSET_ACTIVE_DURATION: usize = 136;
-pub const CONFIG_OFFSET_GRACE_PERIOD_DURATION: usize = 140;
+pub const CONFIG_OFFSET_TREE_ID: usize = 0;
+pub const CONFIG_OFFSET_PRICE_PER_UNIT: usize = 32;
+pub const CONFIG_OFFSET_TREASURY_ACCOUNT_ID: usize = 48;
+pub const CONFIG_OFFSET_TOTAL_REGISTRATIONS: usize = 80;
+pub const CONFIG_OFFSET_MAX_TOTAL_RATE_LIMIT: usize = 88;
+pub const CONFIG_OFFSET_CURRENT_TOTAL_RATE_LIMIT: usize = 96;
+pub const CONFIG_OFFSET_ACTIVE_DURATION: usize = 104;
+pub const CONFIG_OFFSET_GRACE_PERIOD_DURATION: usize = 108;
+pub const CONFIG_OFFSET_NEXT_LEAF_INDEX: usize = 112;
 pub const CONFIG_SIZE: usize = rln_layouts::state::CONFIG_STATE_SIZE;
 
 // Layout source of truth: `rln_layouts::MembershipState`. Same caveat as the
@@ -53,7 +51,6 @@ mod tests {
     #[test]
     fn config_offsets_match_the_shared_layout() {
         let config = ConfigState {
-            merkle_program_id: [0x11; 32],
             tree_id: [0x22; 32],
             price_per_unit: 0xDEAD_BEEF,
             treasury_account_id: [0x33; 32],
@@ -62,14 +59,11 @@ mod tests {
             current_total_rate_limit: 0x0E0F,
             active_duration_for_new_memberships_sec: 0x1011,
             grace_period_duration_for_new_memberships_sec: 0x1213,
+            next_leaf_index: 0x1415,
         };
         let b = borsh::to_vec(&config).expect("ConfigState serializes");
 
         assert_eq!(b.len(), CONFIG_SIZE, "CONFIG_SIZE tracks the layout");
-        assert_eq!(
-            &b[CONFIG_OFFSET_MERKLE_PROGRAM_ID..CONFIG_OFFSET_MERKLE_PROGRAM_ID + 32],
-            &[0x11; 32],
-        );
         assert_eq!(
             &b[CONFIG_OFFSET_TREE_ID..CONFIG_OFFSET_TREE_ID + 32],
             &[0x22; 32]
@@ -126,6 +120,14 @@ mod tests {
                     .unwrap()
             ),
             0x1213,
+        );
+        assert_eq!(
+            u64::from_le_bytes(
+                b[CONFIG_OFFSET_NEXT_LEAF_INDEX..CONFIG_OFFSET_NEXT_LEAF_INDEX + 8]
+                    .try_into()
+                    .unwrap()
+            ),
+            0x1415,
         );
     }
 

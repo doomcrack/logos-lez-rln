@@ -155,7 +155,7 @@ jobs:
         run: |
           set -eu
           base="lez-rln/methods/guest/target/riscv32im-risc0-zkvm-elf/docker"
-          for b in rln_registration incremental_merkle_tree; do
+          for b in rln_registration; do
             test -s "${base}/${b}.bin"
           done
 

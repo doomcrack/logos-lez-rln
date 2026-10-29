@@ -12,8 +12,7 @@ account created and signed at deploy time, recorded by `run_setup`, and every
 PDA hangs off it. The eight profiles that used to live here addressed a program
 that no longer exists, carry no program ids, and describe a config layout — 296
 bytes with a payment token, a faucet cap and a free-quota registrar — that
-nothing can decode any more. `stage.sh` refuses them (missing `payer_account`,
-`merkle_program_id`).
+nothing can decode any more. `stage.sh` refuses them (missing `payer_account`).
 
 They were deleted rather than left as history, because a deployment profile
 that cannot be staged is not a record of anything: it is a trap for whoever
@@ -24,7 +23,7 @@ A descriptor is:
 ```json
 {
   "name": "<name>", "tree_id": "<64 hex>", "sequencer": "<url>",
-  "registration_program_id": "<64 hex>", "merkle_program_id": "<64 hex>",
+  "registration_program_id": "<64 hex>",
   "config_account": "<base58>", "payer_account": "<base58>", "treasury_account": "<base58>"
 }
 ```

@@ -4,10 +4,10 @@
 #
 #   bash stage.sh <deployment_dir> <out_dir>
 #
-# A deployment is captured by tree_id + the two program ids + wallet
-# (storage.json). The program ids (registration_program_id, merkle_program_id)
-# are the header accounts run_setup deployed — recorded state, not derivable
-# from the guest binaries. config is a derived cache of (registration program
+# A deployment is captured by tree_id + the program id + wallet
+# (storage.json). The program id (registration_program_id) is the header
+# account run_setup deployed — recorded state, not derivable from the guest
+# binary. config is a derived cache of (registration program
 # id, tree_id); payer_account is a pointer into the wallet — the account that
 # signs a registration, pays its price in native, and pays its fee.
 # Emits storage.json.seed, wallet_config.json, {config,payer}_account.txt,
@@ -31,14 +31,19 @@ field(){ jq -re ".$1 // empty" "$DESC" 2>/dev/null || fail "descriptor missing r
 
 NAME=$(field name); TREE=$(field tree_id); SEQ=$(field sequencer)
 CFG=$(field config_account); PAY=$(field payer_account); TREASURY=$(field treasury_account)
-REG=$(field registration_program_id); MRK=$(field merkle_program_id)
+REG=$(field registration_program_id)
+# A descriptor naming a merkle_program_id belongs to the on-chain-tree program:
+# its config is 144 bytes with a merkle id at offset 0, and this program's
+# 120-byte config decodes it as plausible garbage. Refuse it outright.
+if jq -e 'has("merkle_program_id")' "$DESC" >/dev/null 2>&1; then
+  fail "descriptor names a merkle_program_id: it is an on-chain-tree deployment, whose config this event-emitting program cannot read — provision a new one"
+fi
 # A pre-native descriptor names payment_account/supply_holding/funding and no
 # payer_account, so `field payer_account` above already failed it — which is
 # what we want: its config account belongs to a program that no longer exists,
 # and every offset in it decodes to something plausible and wrong.
 [[ "$TREE" =~ ^[0-9a-f]{64}$ ]] || fail "tree_id must be 64 lowercase hex chars, got '$TREE'"
 [[ "$REG" =~ ^[0-9a-f]{64}$ ]] || fail "registration_program_id must be 64 lowercase hex chars, got '$REG'"
-[[ "$MRK" =~ ^[0-9a-f]{64}$ ]] || fail "merkle_program_id must be 64 lowercase hex chars, got '$MRK'"
 
 # Wallet schema — refuse a storage.json without the top-level 'key_chain.accounts'.
 jq -e '.key_chain.accounts' "$WALLET" >/dev/null 2>&1 \
@@ -61,12 +66,12 @@ jq '.last_synced_block = 0' "$WALLET" > "$OUT/storage.json.seed"
 # calibrates each sequencer with calibration_limit sequential getLastBlockId
 # probes (default 100) when no statistics file exists — minutes against a slow
 # chain. One sequencer needs no leader election; 3 probes suffice.
-# gas_limit: the wallet's own default is 2,000,000, and a registration costs
-# about 9.1M — an on-chain merkle insert is one Poseidon compression, roughly
-# 902,000 cycles, per level of tree depth, and gas is cycles. A wallet that
-# declares too little has its transaction refused for running out of gas, with
-# nothing in the reply naming the limit it hit. MAX_GAS_EXEC (10M) is the
-# ceiling the protocol enforces; declaring more is refused outright.
+# gas_limit: the wallet's own default is 2,000,000. Gas is cycles; a slash
+# hashes the identity secret (one Poseidon compression, roughly 900,000
+# cycles), and a wallet that declares too little has its transaction refused
+# for running out of gas, with nothing in the reply naming the limit it hit.
+# MAX_GAS_EXEC (10M) is the ceiling the protocol enforces; declaring more is
+# refused outright.
 jq -n --arg s "$SEQ" '{sequencer_addr:$s, sequencer:{sequencer_addr:$s}, sequencers:[{sequencer_addr:$s}], seq_poll_timeout:"30s", seq_tx_poll_max_blocks:15, seq_poll_max_retries:10, seq_block_poll_max_amount:100, gas_limit:10000000, multi_sequencer_client_config:{distribution_limit:1, calibration_limit:3}}' > "$OUT/wallet_config.json"
 cat > "$OUT/env.sh" <<EOF
 #!/usr/bin/env bash
@@ -75,7 +80,6 @@ export LEE_WALLET_HOME_DIR="\$SCRIPT_DIR"
 export LEZ_RLN_TREE_ID_HEX=$TREE
 export LEZ_RLN_PAYER=$PAY
 export LEZ_RLN_REGISTRATION_PROGRAM_ID=$REG
-export LEZ_RLN_MERKLE_PROGRAM_ID=$MRK
 EOF
 
-echo "stage: OK  $NAME  tree=${TREE:0:8}…  reg=${REG:0:8}…  merkle=${MRK:0:8}…  config=$CFG  payer=$PAY  treasury=$TREASURY  -> $OUT"
+echo "stage: OK  $NAME  tree=${TREE:0:8}…  reg=${REG:0:8}…  config=$CFG  payer=$PAY  treasury=$TREASURY  -> $OUT"
